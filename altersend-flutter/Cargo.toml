@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "rust/altersend_domain",
+    "rust/altersend_p2p",
+    "rust/altersend_engine",
+    "rust/altersend_ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/denislupookov/altersend-flutter"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
+tracing = "0.1"
+rand = "0.9"
+hex = "0.4"
+flutter_rust_bridge = "2.11.1"
