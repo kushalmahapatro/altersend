@@ -72,7 +72,7 @@ class AlterSendBridge
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 1811883936;
+  int get rustContentHash => -1815186437;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -97,6 +97,8 @@ abstract class AlterSendBridgeApi extends BaseApi {
 
   Future<String?> crateApiExtractJoinCode({required String text});
 
+  Future<String> crateApiGetSessionStateJson();
+
   Future<String> crateApiGetUiSnapshotJson();
 
   Future<void> crateApiInitApp();
@@ -106,6 +108,8 @@ abstract class AlterSendBridgeApi extends BaseApi {
   Future<bool> crateApiIsValidJoinCode({required String code});
 
   Future<void> crateApiJoinSession({required String joinCode});
+
+  Future<void> crateApiRemoveSelectedFile({required String path});
 }
 
 class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
@@ -263,7 +267,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
       const TaskConstMeta(debugName: "extract_join_code", argNames: ["text"]);
 
   @override
-  Future<String> crateApiGetUiSnapshotJson() {
+  Future<String> crateApiGetSessionStateJson() {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
@@ -272,6 +276,33 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
             generalizedFrbRustBinding,
             serializer,
             funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiGetSessionStateJsonConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiGetSessionStateJsonConstMeta =>
+      const TaskConstMeta(debugName: "get_session_state_json", argNames: []);
+
+  @override
+  Future<String> crateApiGetUiSnapshotJson() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 7,
             port: port_,
           );
         },
@@ -298,7 +329,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 8,
             port: port_,
           );
         },
@@ -326,7 +357,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 9,
             port: port_,
           );
         },
@@ -354,7 +385,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 10,
             port: port_,
           );
         },
@@ -382,7 +413,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 10,
+            funcId: 11,
             port: port_,
           );
         },
@@ -399,6 +430,36 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
 
   TaskConstMeta get kCrateApiJoinSessionConstMeta =>
       const TaskConstMeta(debugName: "join_session", argNames: ["joinCode"]);
+
+  @override
+  Future<void> crateApiRemoveSelectedFile({required String path}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(path, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 12,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiRemoveSelectedFileConstMeta,
+        argValues: [path],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiRemoveSelectedFileConstMeta => const TaskConstMeta(
+    debugName: "remove_selected_file",
+    argNames: ["path"],
+  );
 
   @protected
   String dco_decode_String(dynamic raw) {

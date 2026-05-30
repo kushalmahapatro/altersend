@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use altersend_domain::{
     build_ui_snapshot, create_initial_upload_items, transfer_session_reducer,
@@ -7,13 +8,15 @@ use altersend_domain::{
     SendDraftPhase, SharingStatusEvent, TransferAction, TransferRole, TransferSessionState,
     TransferUiSnapshot,
 };
-use altersend_p2p::{EngineEvent, TransferOrchestrator};
+use altersend_p2p::{DownloadRequest, EngineEvent, TransferOrchestrator};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
 
 pub struct AlterSendEngine {
     state: Arc<RwLock<TransferSessionState>>,
     orchestrator: Arc<Mutex<Option<TransferOrchestrator>>>,
     storage_dir: PathBuf,
+    _watchdog: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AlterSendEngine {
@@ -23,11 +26,17 @@ impl AlterSendEngine {
             state: Arc::new(RwLock::new(TransferSessionState::default())),
             orchestrator: Arc::new(Mutex::new(None)),
             storage_dir,
+            _watchdog: Mutex::new(None),
         })
     }
 
     pub async fn snapshot(&self) -> TransferUiSnapshot {
         build_ui_snapshot(&*self.state.read().await)
+    }
+
+    pub async fn session_state_json(&self) -> Result<String, String> {
+        let state = self.state.read().await.clone();
+        serde_json::to_string(&state).map_err(|e| e.to_string())
     }
 
     async fn dispatch(&self, action: TransferAction) {
@@ -36,11 +45,11 @@ impl AlterSendEngine {
     }
 
     pub async fn boot(&self) -> Result<(), String> {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let download_dir = self.storage_dir.join("downloads");
         std::fs::create_dir_all(&download_dir).ok();
 
-        let mut orchestrator = TransferOrchestrator::new(event_tx, download_dir)
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let orchestrator = TransferOrchestrator::new(event_tx, download_dir)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -51,28 +60,29 @@ impl AlterSendEngine {
             }
         });
 
-        let orch_slot = self.orchestrator.clone();
-        tokio::spawn(async move {
-            loop {
-                let mut guard = orch_slot.lock().await;
-                if let Some(ref mut o) = *guard {
-                    o.run_swarm_loop().await;
-                } else {
-                    drop(guard);
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-        });
-
         *self.orchestrator.lock().await = Some(orchestrator);
         self.dispatch(TransferAction::Booted).await;
+
+        let watchdog_state = self.state.clone();
+        let orch = self.orchestrator.clone();
+        let handle = tokio::spawn(async move {
+            peer_watchdog_loop(watchdog_state, orch).await;
+        });
+        *self._watchdog.lock().await = Some(handle);
+
         Ok(())
     }
 
+    async fn orchestrator(&self) -> Result<tokio::sync::MutexGuard<'_, Option<TransferOrchestrator>>, String> {
+        // Can't return guard easily - use helper methods instead
+        Err("internal".into())
+    }
+
     pub async fn host(&self) -> Result<String, String> {
-        let mut guard = self.orchestrator.lock().await;
-        let orch = guard.as_mut().ok_or("Engine not booted")?;
+        let orch = self.orchestrator.lock().await;
+        let orch = orch.as_ref().ok_or("Engine not booted")?;
         let topic = orch.host().await?;
+        drop(orch);
         self.dispatch(TransferAction::SessionHosted { topic: topic.clone() })
             .await;
         Ok(topic)
@@ -80,34 +90,38 @@ impl AlterSendEngine {
 
     pub async fn join(&self, topic: &str) -> Result<(), String> {
         self.dispatch(TransferAction::JoinRequested).await;
-        let mut guard = self.orchestrator.lock().await;
-        let orch = guard.as_mut().ok_or("Engine not booted")?;
+        let orch = self.orchestrator.lock().await;
+        let orch = orch.as_ref().ok_or("Engine not booted")?;
         orch.join(topic).await
     }
 
     pub async fn share_files(&self, paths: Vec<String>) -> Result<u32, String> {
         self.dispatch(TransferAction::ShareRequested).await;
-        let mut guard = self.orchestrator.lock().await;
-        let orch = guard.as_mut().ok_or("Engine not booted")?;
+        let orch = self.orchestrator.lock().await;
+        let orch = orch.as_ref().ok_or("Engine not booted")?;
         orch.share_files(&paths).await
     }
 
     pub async fn download_all(&self) -> Result<(), String> {
         let state = self.state.read().await.clone();
-        let requests: Vec<(String, String, u64)> = state
+        let requests: Vec<DownloadRequest> = state
             .incoming_file_offers
             .iter()
-            .map(|f| (f.id.clone(), f.name.clone(), f.size))
+            .map(|f| DownloadRequest {
+                file_id: f.id.clone(),
+                file_name: f.name.clone(),
+                total_bytes: f.size,
+            })
             .collect();
-        let mut guard = self.orchestrator.lock().await;
-        let orch = guard.as_mut().ok_or("Engine not booted")?;
+        let orch = self.orchestrator.lock().await;
+        let orch = orch.as_ref().ok_or("Engine not booted")?;
         orch.download_files(requests).await
     }
 
     pub async fn disconnect(&self) -> Result<(), String> {
         self.dispatch(TransferAction::ClearSession).await;
-        let mut guard = self.orchestrator.lock().await;
-        if let Some(orch) = guard.as_mut() {
+        let orch = self.orchestrator.lock().await;
+        if let Some(orch) = orch.as_ref() {
             orch.disconnect().await?;
         }
         Ok(())
@@ -149,28 +163,59 @@ impl AlterSendEngine {
     }
 }
 
+async fn peer_watchdog_loop(
+    state: Arc<RwLock<TransferSessionState>>,
+    orchestrator: Arc<Mutex<Option<TransferOrchestrator>>>,
+) {
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let s = state.read().await.clone();
+        let should_watch =
+            s.role == Some(TransferRole::Receiver) && s.peer_count == 0 && !s.topic.is_empty();
+
+        if !should_watch {
+            deadline = None;
+            continue;
+        }
+
+        let timeout = if s.is_reconnecting || !s.incoming_file_offers.is_empty() {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(60)
+        };
+
+        if deadline.is_none() {
+            deadline = Some(tokio::time::Instant::now() + timeout);
+        }
+
+        if let Some(d) = deadline {
+            if tokio::time::Instant::now() >= d {
+                let current = state.read().await.clone();
+                *state.write().await =
+                    transfer_session_reducer(current, TransferAction::PeerUnreachable);
+                if let Some(orch) = orchestrator.lock().await.as_ref() {
+                    let _ = orch.disconnect().await;
+                }
+                deadline = None;
+            }
+        }
+    }
+}
+
 async fn apply_engine_event(state: &RwLock<TransferSessionState>, event: EngineEvent) {
-    let action = match event {
-        EngineEvent::Ready => TransferAction::Booted,
-        EngineEvent::BootFailed { message } => TransferAction::BootFailed { message },
-        EngineEvent::Status { state: s, peers, peer } => match s.as_str() {
-            "joining" => TransferAction::StatusChanged {
-                state: ConnectionState::Joining,
-                peers,
-            },
-            "joined" => TransferAction::StatusChanged {
-                state: ConnectionState::Joined,
-                peers,
-            },
-            "peer-connected" => TransferAction::StatusChanged {
-                state: ConnectionState::PeerConnected,
-                peers,
-            },
-            "disconnected" => TransferAction::StatusChanged {
-                state: ConnectionState::Disconnected,
-                peers,
-            },
-            "peer-disconnected" => {
+    match event {
+        EngineEvent::Ready => {
+            let current = state.read().await.clone();
+            *state.write().await = transfer_session_reducer(current, TransferAction::Booted);
+        }
+        EngineEvent::BootFailed { message } => {
+            let current = state.read().await.clone();
+            *state.write().await =
+                transfer_session_reducer(current, TransferAction::BootFailed { message });
+        }
+        EngineEvent::Status { state: s, peers, peer } => {
+            if s == "peer-disconnected" {
                 if let Some(peer_key) = peer {
                     let current = state.read().await.clone();
                     *state.write().await = transfer_session_reducer(
@@ -180,20 +225,63 @@ async fn apply_engine_event(state: &RwLock<TransferSessionState>, event: EngineE
                 }
                 return;
             }
-            _ => return,
-        },
-        EngineEvent::Role { role } => TransferAction::RoleChanged {
-            role: role.as_deref().map(|r| {
-                if r == "sender" {
-                    TransferRole::Sender
-                } else {
-                    TransferRole::Receiver
+            if s == "peer-connected" {
+                let current = state.read().await.clone();
+                let next = transfer_session_reducer(
+                    current,
+                    TransferAction::StatusChanged {
+                        state: ConnectionState::PeerConnected,
+                        peers,
+                    },
+                );
+                *state.write().await = next;
+                if let Some(peer_key) = peer {
+                    let current = state.read().await.clone();
+                    *state.write().await = transfer_session_reducer(
+                        current,
+                        TransferAction::PeerJoined { peer_key },
+                    );
                 }
-            }),
-        },
-        EngineEvent::Error { message } => TransferAction::SetError { message },
-        EngineEvent::TransferReady { files } => TransferAction::TransferReady { files },
-        EngineEvent::TransferStart { .. } => return,
+                return;
+            }
+            let conn = match s.as_str() {
+                "joining" => ConnectionState::Joining,
+                "joined" => ConnectionState::Joined,
+                "disconnected" => ConnectionState::Disconnected,
+                _ => return,
+            };
+            let current = state.read().await.clone();
+            *state.write().await = transfer_session_reducer(
+                current,
+                TransferAction::StatusChanged { state: conn, peers },
+            );
+        }
+        EngineEvent::Role { role } => {
+            let current = state.read().await.clone();
+            *state.write().await = transfer_session_reducer(
+                current,
+                TransferAction::RoleChanged {
+                    role: role.as_deref().map(|r| {
+                        if r == "sender" {
+                            TransferRole::Sender
+                        } else {
+                            TransferRole::Receiver
+                        }
+                    }),
+                },
+            );
+        }
+        EngineEvent::Error { message } => {
+            let current = state.read().await.clone();
+            *state.write().await =
+                transfer_session_reducer(current, TransferAction::SetError { message });
+        }
+        EngineEvent::TransferReady { files } => {
+            let current = state.read().await.clone();
+            *state.write().await =
+                transfer_session_reducer(current, TransferAction::TransferReady { files });
+        }
+        EngineEvent::TransferStart { .. } => {}
         EngineEvent::DownloadStatus {
             state: s,
             file_name,
@@ -203,7 +291,7 @@ async fn apply_engine_event(state: &RwLock<TransferSessionState>, event: EngineE
             saved_to,
             message,
         } => {
-            if s == "sharing" {
+            let action = if s == "sharing" {
                 if let (Some(name), Some(bytes), Some(total)) =
                     (file_name, bytes_transferred, total_bytes)
                 {
@@ -229,10 +317,12 @@ async fn apply_engine_event(state: &RwLock<TransferSessionState>, event: EngineE
                         message,
                     },
                 }
-            }
+            };
+            let current = state.read().await.clone();
+            *state.write().await = transfer_session_reducer(current, action);
         }
         EngineEvent::PeerDownload {
-            state,
+            state: download_state,
             file_id,
             file_name,
             bytes_transferred,
@@ -240,19 +330,23 @@ async fn apply_engine_event(state: &RwLock<TransferSessionState>, event: EngineE
             saved_to,
             message,
             peer,
-        } => TransferAction::PeerDownloadEvent {
-            event: PeerDownloadStatusEvent {
-                state,
-                file_id: Some(file_id),
-                file_name: Some(file_name),
-                bytes_transferred: Some(bytes_transferred),
-                total_bytes: Some(total_bytes),
-                saved_to,
-                message,
-                peer: Some(peer),
-            },
-        },
-    };
-    let current = state.read().await.clone();
-    *state.write().await = transfer_session_reducer(current, action);
+        } => {
+            let current = state.read().await.clone();
+            *state.write().await = transfer_session_reducer(
+                current,
+                TransferAction::PeerDownloadEvent {
+                    event: PeerDownloadStatusEvent {
+                        state: download_state,
+                        file_id: Some(file_id),
+                        file_name: Some(file_name),
+                        bytes_transferred: Some(bytes_transferred),
+                        total_bytes: Some(total_bytes),
+                        saved_to,
+                        message,
+                        peer: Some(peer),
+                    },
+                },
+            );
+        }
+    }
 }

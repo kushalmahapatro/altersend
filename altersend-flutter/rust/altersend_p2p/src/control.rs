@@ -75,34 +75,24 @@ pub struct FileOffer {
     pub drive_key: String,
 }
 
-pub fn encode_control(msg: &PeerControlMessage) -> Vec<u8> {
+pub fn encode_control_payload(msg: &PeerControlMessage) -> Vec<u8> {
     let value = serde_json::to_value(msg).expect("serialize control");
     let mut obj = match value {
         Value::Object(map) => map,
         _ => serde_json::Map::new(),
     };
-    obj.insert(
-        "protocolVersion".to_string(),
-        json!(PROTOCOL_VERSION),
-    );
-    let json = serde_json::to_vec(&Value::Object(obj)).expect("serialize");
-    let mut out = (json.len() as u32).to_be_bytes().to_vec();
-    out.extend(json);
-    out
+    obj.insert("protocolVersion".to_string(), json!(PROTOCOL_VERSION));
+    serde_json::to_vec(&Value::Object(obj)).expect("serialize")
 }
 
-pub fn decode_control(bytes: &[u8]) -> Option<PeerControlMessage> {
-    if bytes.len() < 4 {
-        return None;
-    }
-    let len = u32::from_be_bytes(bytes[..4].try_into().ok()?) as usize;
-    if bytes.len() < 4 + len {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(&bytes[4..4 + len]).ok()?;
+pub fn decode_control_payload(bytes: &[u8]) -> Option<PeerControlMessage> {
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
     let version = value.get("protocolVersion")?.as_u64()? as u32;
     if version != PROTOCOL_VERSION {
         return None;
+    }
+    if let Value::Object(ref mut map) = value {
+        map.remove("protocolVersion");
     }
     serde_json::from_value(value).ok()
 }

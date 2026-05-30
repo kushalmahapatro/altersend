@@ -12,6 +12,9 @@ Future<void> initEngine({required String storagePath}) =>
     AlterSendBridge.instance.api.crateApiInitEngine(storagePath: storagePath);
 
 /// JSON-encoded [`altersend_domain::TransferUiSnapshot`].
+Future<String> getSessionStateJson() =>
+    AlterSendBridge.instance.api.crateApiGetSessionStateJson();
+
 Future<String> getUiSnapshotJson() =>
     AlterSendBridge.instance.api.crateApiGetUiSnapshotJson();
 
@@ -33,6 +36,9 @@ Future<void> joinSession({required String joinCode}) =>
 
 Future<void> downloadAllFiles() =>
     AlterSendBridge.instance.api.crateApiDownloadAllFiles();
+
+Future<void> removeSelectedFile({required String path}) =>
+    AlterSendBridge.instance.api.crateApiRemoveSelectedFile(path: path);
 
 Future<void> clearSession() =>
     AlterSendBridge.instance.api.crateApiClearSession();

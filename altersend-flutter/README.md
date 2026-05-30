@@ -39,6 +39,8 @@ This mirrors the original stack (`packages/domain` + `packages/core` worklet + a
 | Hyperswarm topic discovery (peeroxide) | ✅ |
 | Control protocol (`transfer-start`, `transfer-ready`, download events) | ✅ |
 | Session state machine (ported reducer) | ✅ |
+| File bytes over P2P (chunked wire protocol) | ✅ |
+| Peer watchdog (receiver timeout) | ✅ |
 | Hyperdrive replication (interop with Electron/RN app) | 🚧 Roadmap |
 | QR scan / deep links / Photos save | 🚧 Platform plugins |
 

@@ -4,8 +4,10 @@ mod control;
 mod orchestrator;
 mod swarm;
 mod transfer;
+mod wire;
 
 pub use control::*;
 pub use orchestrator::*;
 pub use swarm::*;
 pub use transfer::*;
+pub use wire::*;

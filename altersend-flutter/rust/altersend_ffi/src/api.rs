@@ -33,6 +33,11 @@ pub async fn init_engine(storage_path: String) -> Result<(), String> {
 
 /// JSON-encoded [`altersend_domain::TransferUiSnapshot`].
 #[frb]
+pub async fn get_session_state_json() -> Result<String, String> {
+    engine().await?.session_state_json().await
+}
+
+#[frb]
 pub async fn get_ui_snapshot_json() -> Result<String, String> {
     let snapshot = engine().await?.snapshot().await;
     serde_json::to_string(&snapshot).map_err(|e| e.to_string())
@@ -70,6 +75,12 @@ pub async fn join_session(join_code: String) -> Result<(), String> {
 #[frb]
 pub async fn download_all_files() -> Result<(), String> {
     engine().await?.download_all().await
+}
+
+#[frb]
+pub async fn remove_selected_file(path: String) -> Result<(), String> {
+    engine().await?.remove_selected_file(path).await;
+    Ok(())
 }
 
 #[frb]
