@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use altersend_domain::{
     build_ui_snapshot, create_initial_upload_items, transfer_session_reducer,
-    ConnectionState, PeerDownloadStatusEvent, ReceiveDownloadStatusEvent, SelectedFile,
-    SendDraftPhase, SharingStatusEvent, TransferAction, TransferRole, TransferSessionState,
-    TransferUiSnapshot,
+    ConnectionState, PeerDownloadStatusEvent, ReceiveDownloadStatusEvent, SaveDestination,
+    SelectedFile, SendDraftPhase, SharingStatusEvent, TransferAction, TransferRole,
+    TransferSessionState, TransferUiSnapshot,
 };
 use altersend_p2p::{DownloadRequest, EngineEvent, TransferOrchestrator};
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -139,6 +139,22 @@ impl AlterSendEngine {
     pub async fn remove_selected_file(&self, path: String) {
         self.dispatch(TransferAction::RemoveSelectedFile { path })
             .await;
+    }
+
+    pub async fn route_download(
+        &self,
+        offer_key: String,
+        destination: SaveDestination,
+        intended_destination: SaveDestination,
+        saved_to: String,
+    ) {
+        self.dispatch(TransferAction::DownloadRouted {
+            offer_key,
+            destination,
+            intended_destination,
+            saved_to: Some(saved_to),
+        })
+        .await;
     }
 
     pub async fn continue_share(&self) -> Result<(), String> {

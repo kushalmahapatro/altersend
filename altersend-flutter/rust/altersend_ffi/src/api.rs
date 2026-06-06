@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use altersend_domain::SelectedFile;
+use altersend_domain::{onboarding_slides, SelectedFile, SaveDestination};
 use altersend_engine::AlterSendEngine;
 use flutter_rust_bridge::frb;
 use tokio::sync::Mutex;
@@ -105,8 +105,37 @@ pub fn build_join_url(topic: String) -> String {
 
 #[frb]
 pub async fn can_join_from_deep_link(code: String) -> bool {
+    match engine().await {
+        Ok(e) => e.can_join_from_deep_link(&code).await,
+        Err(_) => false,
+    }
+}
+
+#[frb]
+pub fn get_onboarding_slides_json() -> String {
+    serde_json::to_string(&onboarding_slides()).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[frb]
+pub async fn route_download(
+    offer_key: String,
+    saved_to: String,
+    destination: String,
+    intended_destination: String,
+) -> Result<(), String> {
+    let destination = parse_save_destination(&destination)?;
+    let intended_destination = parse_save_destination(&intended_destination)?;
     engine()
-        .await
-        .map(|e| e.can_join_from_deep_link(&code))
-        .unwrap_or(false)
+        .await?
+        .route_download(offer_key, destination, intended_destination, saved_to)
+        .await;
+    Ok(())
+}
+
+fn parse_save_destination(value: &str) -> Result<SaveDestination, String> {
+    match value {
+        "photos" => Ok(SaveDestination::Photos),
+        "filesystem" => Ok(SaveDestination::Filesystem),
+        _ => Err(format!("unknown save destination: {value}")),
+    }
 }

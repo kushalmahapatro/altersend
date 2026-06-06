@@ -72,7 +72,7 @@ class AlterSendBridge
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => -1815186437;
+  int get rustContentHash => 1564638482;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -89,6 +89,10 @@ abstract class AlterSendBridgeApi extends BaseApi {
     required Uint64List sizes,
   });
 
+  Future<String> crateApiBuildJoinUrl({required String topic});
+
+  Future<bool> crateApiCanJoinFromDeepLink({required String code});
+
   Future<void> crateApiClearSession();
 
   Future<void> crateApiContinueShare();
@@ -96,6 +100,8 @@ abstract class AlterSendBridgeApi extends BaseApi {
   Future<void> crateApiDownloadAllFiles();
 
   Future<String?> crateApiExtractJoinCode({required String text});
+
+  Future<String> crateApiGetOnboardingSlidesJson();
 
   Future<String> crateApiGetSessionStateJson();
 
@@ -110,6 +116,13 @@ abstract class AlterSendBridgeApi extends BaseApi {
   Future<void> crateApiJoinSession({required String joinCode});
 
   Future<void> crateApiRemoveSelectedFile({required String path});
+
+  Future<void> crateApiRouteDownload({
+    required String offerKey,
+    required String savedTo,
+    required String destination,
+    required String intendedDestination,
+  });
 }
 
 class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
@@ -158,6 +171,65 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
   );
 
   @override
+  Future<String> crateApiBuildJoinUrl({required String topic}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(topic, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 2,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiBuildJoinUrlConstMeta,
+        argValues: [topic],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiBuildJoinUrlConstMeta =>
+      const TaskConstMeta(debugName: "build_join_url", argNames: ["topic"]);
+
+  @override
+  Future<bool> crateApiCanJoinFromDeepLink({required String code}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(code, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 3,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiCanJoinFromDeepLinkConstMeta,
+        argValues: [code],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiCanJoinFromDeepLinkConstMeta =>
+      const TaskConstMeta(
+        debugName: "can_join_from_deep_link",
+        argNames: ["code"],
+      );
+
+  @override
   Future<void> crateApiClearSession() {
     return handler.executeNormal(
       NormalTask(
@@ -166,7 +238,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 2,
+            funcId: 4,
             port: port_,
           );
         },
@@ -193,7 +265,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 5,
             port: port_,
           );
         },
@@ -220,7 +292,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 6,
             port: port_,
           );
         },
@@ -248,7 +320,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 7,
             port: port_,
           );
         },
@@ -267,6 +339,36 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
       const TaskConstMeta(debugName: "extract_join_code", argNames: ["text"]);
 
   @override
+  Future<String> crateApiGetOnboardingSlidesJson() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiGetOnboardingSlidesJsonConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiGetOnboardingSlidesJsonConstMeta =>
+      const TaskConstMeta(
+        debugName: "get_onboarding_slides_json",
+        argNames: [],
+      );
+
+  @override
   Future<String> crateApiGetSessionStateJson() {
     return handler.executeNormal(
       NormalTask(
@@ -275,7 +377,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 9,
             port: port_,
           );
         },
@@ -302,7 +404,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 10,
             port: port_,
           );
         },
@@ -329,7 +431,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 11,
             port: port_,
           );
         },
@@ -357,7 +459,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 12,
             port: port_,
           );
         },
@@ -385,7 +487,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 10,
+            funcId: 13,
             port: port_,
           );
         },
@@ -413,7 +515,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 11,
+            funcId: 14,
             port: port_,
           );
         },
@@ -441,7 +543,7 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 12,
+            funcId: 15,
             port: port_,
           );
         },
@@ -459,6 +561,44 @@ class AlterSendBridgeApiImpl extends AlterSendBridgeApiImplPlatform
   TaskConstMeta get kCrateApiRemoveSelectedFileConstMeta => const TaskConstMeta(
     debugName: "remove_selected_file",
     argNames: ["path"],
+  );
+
+  @override
+  Future<void> crateApiRouteDownload({
+    required String offerKey,
+    required String savedTo,
+    required String destination,
+    required String intendedDestination,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(offerKey, serializer);
+          sse_encode_String(savedTo, serializer);
+          sse_encode_String(destination, serializer);
+          sse_encode_String(intendedDestination, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 16,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiRouteDownloadConstMeta,
+        argValues: [offerKey, savedTo, destination, intendedDestination],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiRouteDownloadConstMeta => const TaskConstMeta(
+    debugName: "route_download",
+    argNames: ["offerKey", "savedTo", "destination", "intendedDestination"],
   );
 
   @protected

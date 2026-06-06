@@ -44,12 +44,14 @@ This mirrors the original stack (`packages/domain` + `packages/core` worklet + a
 | QR code display on send (join URL) | ✅ |
 | QR scan on receive (mobile) | ✅ |
 | Deep links (`altersend://`, `com.altersend.mobile://`) | ✅ |
+| Onboarding slides (first launch) | ✅ |
+| Mobile photo picker (send) | ✅ |
+| Photos library save on receive (mobile) | ✅ |
 | Hyperdrive replication (interop with Electron/RN app) | 🚧 Roadmap |
-| Photos library save (mobile) | 🚧 Platform plugins |
 
 ## Prerequisites
 
-- **Rust** 1.85+ (2024 edition)
+- **Rust** 1.85+
 - **Flutter** 3.22+ stable
 - Linux/macOS/Windows for desktop; mobile toolchains for iOS/Android
 

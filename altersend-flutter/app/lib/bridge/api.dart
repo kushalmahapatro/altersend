@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `engine`
+// These functions are ignored because they are not marked as `pub`: `engine`, `parse_save_destination`
 
 Future<void> initEngine({required String storagePath}) =>
     AlterSendBridge.instance.api.crateApiInitEngine(storagePath: storagePath);
@@ -48,3 +48,24 @@ Future<bool> isValidJoinCode({required String code}) =>
 
 Future<String?> extractJoinCode({required String text}) =>
     AlterSendBridge.instance.api.crateApiExtractJoinCode(text: text);
+
+Future<String> buildJoinUrl({required String topic}) =>
+    AlterSendBridge.instance.api.crateApiBuildJoinUrl(topic: topic);
+
+Future<bool> canJoinFromDeepLink({required String code}) =>
+    AlterSendBridge.instance.api.crateApiCanJoinFromDeepLink(code: code);
+
+Future<String> getOnboardingSlidesJson() =>
+    AlterSendBridge.instance.api.crateApiGetOnboardingSlidesJson();
+
+Future<void> routeDownload({
+  required String offerKey,
+  required String savedTo,
+  required String destination,
+  required String intendedDestination,
+}) => AlterSendBridge.instance.api.crateApiRouteDownload(
+  offerKey: offerKey,
+  savedTo: savedTo,
+  destination: destination,
+  intendedDestination: intendedDestination,
+);

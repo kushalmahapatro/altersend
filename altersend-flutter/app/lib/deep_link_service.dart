@@ -1,7 +1,6 @@
 import 'package:app_links/app_links.dart';
 
 import 'bridge/api.dart';
-import 'bridge_helpers.dart';
 
 /// Handles `altersend://join/<code>` and `com.altersend.mobile://join/<code>`.
 class DeepLinkService {
