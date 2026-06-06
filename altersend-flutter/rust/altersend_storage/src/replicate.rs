@@ -1,25 +1,52 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tokio::sync::RwLock;
+use tracing::info;
 
-/// Placeholder for `corestore.replicate(socket, { live: true })`.
-///
-/// When Hyperdrive interop lands, this will run hypercore-protocol replication
-/// on the same encrypted peer stream that carries Protomux channels.
+/// Tracks active outgoing drive keys for replication with connected peers.
+#[derive(Default)]
+pub struct ReplicationRegistry {
+    active_drive_keys: RwLock<HashMap<String, String>>,
+}
+
+impl ReplicationRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub async fn set_active_drive(&self, peer_key: &str, drive_key_hex: &str) {
+        self.active_drive_keys
+            .write()
+            .await
+            .insert(peer_key.to_string(), drive_key_hex.to_string());
+    }
+
+    pub async fn clear_peer(&self, peer_key: &str) {
+        self.active_drive_keys.write().await.remove(peer_key);
+    }
+
+    pub async fn clear_all(&self) {
+        self.active_drive_keys.write().await.clear();
+    }
+}
+
+/// Attached when a peer connects. Hypercore protomux replication will plug in here.
 pub struct ReplicationHandle {
-    _inner: Arc<Mutex<()>>,
+    peer_key: String,
+    registry: Arc<ReplicationRegistry>,
 }
 
 impl ReplicationHandle {
-    pub fn attach_peer(_peer_key: &str, _is_initiator: bool) -> Self {
-        info!("replication hook attached (hyperdrive staging pending)");
+    pub fn attach_peer(peer_key: &str, registry: Arc<ReplicationRegistry>) -> Self {
+        info!("replication hook attached for peer {peer_key}");
         Self {
-            _inner: Arc::new(Mutex::new(())),
+            peer_key: peer_key.to_string(),
+            registry,
         }
     }
 
-    pub async fn detach(&self) {
-        warn!("replication hook detached");
+    pub async fn detach(self) {
+        self.registry.clear_peer(&self.peer_key).await;
     }
 }

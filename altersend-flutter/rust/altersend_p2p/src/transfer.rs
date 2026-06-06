@@ -140,6 +140,27 @@ where
     Ok(())
 }
 
+pub async fn send_file_chunks_reader<Fut>(
+    total_size: u64,
+    mut read_at: impl FnMut(u64, &mut [u8]) -> Fut,
+    mut on_chunk: impl FnMut(u64, &[u8]) -> Fut,
+) -> Result<(), String>
+where
+    Fut: std::future::Future<Output = Result<usize, String>>,
+{
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    while offset < total_size {
+        let n = read_at(offset, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        on_chunk(offset, &buf[..n]).await?;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
 pub struct IncomingDownload {
     pub path: PathBuf,
     pub total_bytes: u64,

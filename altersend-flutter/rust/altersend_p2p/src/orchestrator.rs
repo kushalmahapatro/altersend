@@ -1,8 +1,9 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use altersend_domain::IncomingFileOffer;
+use altersend_storage::{OutgoingDrive, ReplicationRegistry};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -74,6 +75,9 @@ struct OrchestratorState {
     staged_files: Vec<ScannedFile>,
     file_offers: Vec<FileOffer>,
     downloads: HashMap<String, IncomingDownload>,
+    connected_peers: HashSet<String>,
+    drive: Option<Arc<Mutex<OutgoingDrive>>>,
+    drive_key: Option<String>,
 }
 
 pub struct TransferOrchestrator {
@@ -84,12 +88,14 @@ pub struct TransferOrchestrator {
 impl TransferOrchestrator {
     pub async fn new(
         event_tx: mpsc::UnboundedSender<EngineEvent>,
+        storage_root: PathBuf,
         download_dir: PathBuf,
     ) -> Result<Self, peeroxide::SwarmError> {
         let (orch_tx, mut orch_rx) = mpsc::unbounded_channel();
         let (swarm_inbound_tx, mut swarm_inbound_rx) = mpsc::unbounded_channel();
 
-        let swarm = SwarmRuntime::start(swarm_inbound_tx).await?;
+        let replication_registry = ReplicationRegistry::new();
+        let swarm = SwarmRuntime::start(swarm_inbound_tx, replication_registry.clone()).await?;
         let swarm_client = swarm.client.clone();
 
         let state = Arc::new(Mutex::new(OrchestratorState {
@@ -99,11 +105,15 @@ impl TransferOrchestrator {
             staged_files: Vec::new(),
             file_offers: Vec::new(),
             downloads: HashMap::new(),
+            connected_peers: HashSet::new(),
+            drive: None,
+            drive_key: None,
         }));
 
         let cmd_tx = orch_tx.clone();
         let event_tx_loop = event_tx.clone();
         let swarm_for_loop = swarm_client.clone();
+        let drive_dir = storage_root.join("outgoing-drive");
 
         let task = tokio::spawn(async move {
             let mut swarm_client = swarm_for_loop;
@@ -116,6 +126,7 @@ impl TransferOrchestrator {
                             &swarm_client,
                             &event_tx_loop,
                             &download_dir,
+                            &replication_registry,
                             inbound,
                         ).await;
                     }
@@ -126,6 +137,8 @@ impl TransferOrchestrator {
                             &mut swarm_client,
                             &event_tx_loop,
                             &download_dir,
+                            &drive_dir,
+                            &replication_registry,
                             cmd,
                         ).await;
                     }
@@ -179,6 +192,8 @@ async fn handle_command(
     swarm: &mut SwarmHandleClient,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
     download_dir: &PathBuf,
+    drive_dir: &Path,
+    replication_registry: &Arc<ReplicationRegistry>,
     cmd: OrchestratorCommand,
 ) {
     match cmd {
@@ -212,7 +227,15 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         OrchestratorCommand::ShareFiles(paths, reply) => {
-            let result = share_files(state, swarm, event_tx, paths).await;
+            let result = share_files(
+                state,
+                swarm,
+                event_tx,
+                drive_dir,
+                replication_registry,
+                paths,
+            )
+            .await;
             let _ = reply.send(result);
         }
         OrchestratorCommand::DownloadFiles(requests, reply) => {
@@ -221,7 +244,7 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         OrchestratorCommand::Disconnect(reply) => {
-            let result = disconnect(state, swarm, event_tx).await;
+            let result = disconnect(state, swarm, event_tx, drive_dir, replication_registry).await;
             let _ = reply.send(result);
         }
     }
@@ -232,15 +255,20 @@ async fn handle_swarm_inbound(
     swarm: &SwarmHandleClient,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
     download_dir: &PathBuf,
+    replication_registry: &Arc<ReplicationRegistry>,
     inbound: SwarmInbound,
 ) {
     match inbound {
         SwarmInbound::PeerConnected(peer) => {
+            state.lock().await.connected_peers.insert(peer.clone());
+            register_drive_for_peer(state, replication_registry, &peer).await;
             let count = swarm.peer_count().await as u32;
             emit_status(event_tx, "peer-connected", Some(count), Some(peer.clone())).await;
             replay_active_transfer(state, swarm).await;
         }
         SwarmInbound::PeerDisconnected(peer) => {
+            state.lock().await.connected_peers.remove(&peer);
+            replication_registry.clear_peer(&peer).await;
             let count = swarm.peer_count().await as u32;
             let _ = event_tx.send(EngineEvent::Status {
                 state: "peer-disconnected".into(),
@@ -329,6 +357,7 @@ async fn handle_control(
             }
             let staged = guard.staged_files.clone();
             let offers = guard.file_offers.clone();
+            let drive = guard.drive.clone();
             drop(guard);
 
             let _ = event_tx.send(EngineEvent::PeerDownload {
@@ -347,7 +376,12 @@ async fn handle_control(
                 return;
             };
 
-            let path = file.input_path.clone();
+            let Some(drive) = drive else {
+                warn!("download-request before drive staged");
+                return;
+            };
+
+            let display_path = file.input_path.display().to_string();
             let size = file.size;
             let transfer_id_clone = transfer_id.clone();
             let file_id_clone = file_id.clone();
@@ -361,11 +395,12 @@ async fn handle_control(
                     &swarm,
                     &event_tx,
                     &peer_clone,
-                    &path,
-                    size,
-                    &transfer_id_clone,
+                    drive,
                     &file_id_clone,
                     &file_name_clone,
+                    size,
+                    &transfer_id_clone,
+                    &display_path,
                 )
                 .await
                 {
@@ -510,27 +545,33 @@ async fn send_file_to_peer(
     swarm: &SwarmHandleClient,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
     peer: &str,
-    path: &std::path::Path,
-    total_size: u64,
-    transfer_id: &str,
+    drive: Arc<Mutex<OutgoingDrive>>,
     file_id: &str,
     file_name: &str,
+    total_size: u64,
+    transfer_id: &str,
+    display_path: &str,
 ) -> Result<(), String> {
-    use crate::transfer::send_file_chunks;
+    use crate::transfer::CHUNK_SIZE;
 
-    send_file_chunks(path, total_size, |offset, chunk| {
-        let swarm = swarm.clone();
-        let peer = peer.to_string();
-        let file_id = file_id.to_string();
-        let data = chunk.to_vec();
-        async move {
-            swarm
-                .send_chunk_to_peer(&peer, &file_id, offset, data)
-                .await;
-            Ok(())
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    while offset < total_size {
+        let n = {
+            let mut guard = drive.lock().await;
+            guard
+                .read_file_range(file_id, offset, &mut buf)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        if n == 0 {
+            break;
         }
-    })
-    .await?;
+        swarm
+            .send_chunk_to_peer(peer, file_id, offset, buf[..n].to_vec())
+            .await;
+        offset += n as u64;
+    }
 
     let progress = PeerControlMessage::DownloadProgress {
         transfer_id: transfer_id.to_string(),
@@ -558,7 +599,7 @@ async fn send_file_to_peer(
         transfer_id: transfer_id.to_string(),
         file_id: file_id.to_string(),
         file_name: file_name.to_string(),
-        saved_to: path.display().to_string(),
+        saved_to: display_path.to_string(),
     };
     swarm
         .broadcast_bytes(encode_control_frame(&complete))
@@ -571,6 +612,8 @@ async fn share_files(
     state: &Arc<Mutex<OrchestratorState>>,
     swarm: &SwarmHandleClient,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
+    drive_dir: &Path,
+    replication_registry: &Arc<ReplicationRegistry>,
     paths: Vec<String>,
 ) -> Result<u32, String> {
     let scan = scan_files(&paths).await;
@@ -586,14 +629,43 @@ async fn share_files(
     set_role(state, event_tx, Some("sender")).await;
 
     let transfer_id = create_transfer_id();
-    let drive_key = hex::encode(rand::random::<[u8; 32]>());
+    reset_outgoing_drive_dir(drive_dir).await?;
+
+    let session_drive_dir = drive_dir.join(&transfer_id);
+    let mut drive = OutgoingDrive::open(&session_drive_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for file in &scan.files {
+        drive
+            .stage_file(
+                &file.file_id,
+                &file.file_name,
+                &format!("/{}", file.file_name),
+                &file.input_path,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let drive_key = drive.key_hex();
+    let drive = Arc::new(Mutex::new(drive));
     let offers = build_file_offers(&transfer_id, &drive_key, &scan.files);
 
-    {
+    let peers_to_register = {
         let mut guard = state.lock().await;
         guard.transfer_id = Some(transfer_id.clone());
         guard.staged_files = scan.files.clone();
         guard.file_offers = offers.clone();
+        guard.drive = Some(drive);
+        guard.drive_key = Some(drive_key.clone());
+        guard.connected_peers.iter().cloned().collect::<Vec<_>>()
+    };
+
+    for peer in peers_to_register {
+        replication_registry
+            .set_active_drive(&peer, &drive_key)
+            .await;
     }
 
     let start = PeerControlMessage::TransferStart {
@@ -686,8 +758,11 @@ async fn disconnect(
     state: &Arc<Mutex<OrchestratorState>>,
     swarm: &SwarmHandleClient,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
+    drive_dir: &Path,
+    replication_registry: &Arc<ReplicationRegistry>,
 ) -> Result<(), String> {
     swarm.end_session().await;
+    replication_registry.clear_all().await;
     let mut guard = state.lock().await;
     guard.role = None;
     guard.topic_hex = None;
@@ -695,9 +770,43 @@ async fn disconnect(
     guard.staged_files.clear();
     guard.file_offers.clear();
     guard.downloads.clear();
+    guard.connected_peers.clear();
+    guard.drive = None;
+    guard.drive_key = None;
     drop(guard);
+    reset_outgoing_drive_dir(drive_dir).await?;
     set_role(state, event_tx, None).await;
     emit_status(event_tx, "disconnected", Some(0), None).await;
+    Ok(())
+}
+
+async fn register_drive_for_peer(
+    state: &Arc<Mutex<OrchestratorState>>,
+    replication_registry: &Arc<ReplicationRegistry>,
+    peer: &str,
+) {
+    let guard = state.lock().await;
+    if guard.role.as_deref() != Some("sender") {
+        return;
+    }
+    let Some(drive_key) = guard.drive_key.clone() else {
+        return;
+    };
+    drop(guard);
+    replication_registry
+        .set_active_drive(peer, &drive_key)
+        .await;
+}
+
+async fn reset_outgoing_drive_dir(drive_dir: &Path) -> Result<(), String> {
+    if drive_dir.exists() {
+        tokio::fs::remove_dir_all(drive_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tokio::fs::create_dir_all(drive_dir)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

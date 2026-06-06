@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use altersend_storage::ReplicationHandle;
+use altersend_storage::{ReplicationHandle, ReplicationRegistry};
 use bytes::Bytes;
 use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig, SwarmConnection, SwarmHandle};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -62,7 +62,10 @@ pub struct SwarmRuntime {
 }
 
 impl SwarmRuntime {
-    pub async fn start(inbound_tx: mpsc::UnboundedSender<SwarmInbound>) -> Result<Self, peeroxide::SwarmError> {
+    pub async fn start(
+        inbound_tx: mpsc::UnboundedSender<SwarmInbound>,
+        replication_registry: Arc<ReplicationRegistry>,
+    ) -> Result<Self, peeroxide::SwarmError> {
         let config = SwarmConfig::with_public_bootstrap();
         let (_join_handle, swarm, conn_rx) = spawn(config).await?;
 
@@ -81,6 +84,7 @@ impl SwarmRuntime {
                 sessions,
                 peer_count,
                 raw_topic,
+                replication_registry,
             )
             .await;
         });
@@ -174,6 +178,7 @@ async fn swarm_actor(
     sessions: Arc<RwLock<HashMap<PeerKey, PeerHandle>>>,
     peer_count: Arc<Mutex<usize>>,
     raw_topic: Arc<Mutex<Option<[u8; 32]>>>,
+    replication_registry: Arc<ReplicationRegistry>,
 ) {
     loop {
         tokio::select! {
@@ -242,7 +247,8 @@ async fn swarm_actor(
                 let Some(conn) = conn else { continue };
                 let peer_key = hex::encode(conn.remote_public_key());
                 let is_initiator = conn.is_initiator;
-                let _replication = ReplicationHandle::attach_peer(&peer_key, is_initiator);
+                let replication =
+                    ReplicationHandle::attach_peer(&peer_key, replication_registry.clone());
 
                 {
                     let mut count = peer_count.lock().await;
@@ -341,6 +347,7 @@ async fn swarm_actor(
                         let mut count = peer_count_read.lock().await;
                         *count = count.saturating_sub(1);
                     }
+                    replication.detach().await;
                     let _ = inbound.send(SwarmInbound::PeerDisconnected(peer_for_task));
                 });
             }

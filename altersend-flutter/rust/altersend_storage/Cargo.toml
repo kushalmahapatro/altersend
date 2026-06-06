@@ -16,7 +16,7 @@ tracing = { workspace = true }
 [dependencies.hypercore]
 version = "0.16"
 default-features = false
-features = ["tokio"]
+features = ["tokio", "replication"]
 
 [dependencies.hypercore-protocol]
 version = "0.7"
