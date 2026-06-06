@@ -1,14 +1,20 @@
 import 'dart:async';
-import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart' show Uint64List;
 import 'package:path_provider/path_provider.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import 'bridge/api.dart';
 import 'bridge/frb_generated.dart';
+import 'bridge_helpers.dart';
+import 'deep_link_service.dart';
+import 'qr_scan_screen.dart';
+import 'session_data.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,15 +50,21 @@ class HomeShell extends StatefulWidget {
 class _HomeShellState extends State<HomeShell> {
   int _tab = 0;
   Timer? _poll;
+  final _receiveKey = GlobalKey<_ReceivePageState>();
 
   @override
   void initState() {
     super.initState();
     _poll = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) {
-        setState(() {});
-      }
+      if (mounted) setState(() {});
     });
+    DeepLinkService.start(onJoinCode: _handleDeepLinkJoin);
+  }
+
+  Future<void> _handleDeepLinkJoin(String code) async {
+    if (!mounted) return;
+    setState(() => _tab = 1);
+    await _receiveKey.currentState?.joinWithCode(code);
   }
 
   @override
@@ -78,7 +90,10 @@ class _HomeShellState extends State<HomeShell> {
       ),
       body: IndexedStack(
         index: _tab,
-        children: const [SendPage(), ReceivePage()],
+        children: [
+          const SendPage(),
+          ReceivePage(key: _receiveKey),
+        ],
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
@@ -88,22 +103,6 @@ class _HomeShellState extends State<HomeShell> {
           NavigationDestination(icon: Icon(Icons.download), label: 'Receive'),
         ],
       ),
-    );
-  }
-}
-
-class _SessionData {
-  _SessionData({required this.ui, required this.session});
-
-  final Map<String, dynamic> ui;
-  final Map<String, dynamic> session;
-
-  static Future<_SessionData> load() async {
-    final uiJson = await getUiSnapshotJson();
-    final sessionJson = await getSessionStateJson();
-    return _SessionData(
-      ui: jsonDecode(uiJson) as Map<String, dynamic>,
-      session: jsonDecode(sessionJson) as Map<String, dynamic>,
     );
   }
 }
@@ -160,8 +159,8 @@ class _SendPageState extends State<SendPage> {
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<_SessionData>(
-      future: _SessionData.load(),
+    return FutureBuilder<SessionData>(
+      future: SessionData.load(),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator());
@@ -170,6 +169,7 @@ class _SendPageState extends State<SendPage> {
         final session = snap.data!.session;
         final sendCopy = ui['send_copy'] as Map<String, dynamic>?;
         final topic = ui['topic'] as String? ?? '';
+        final joinUrl = topic.isEmpty ? '' : buildJoinUrl(topic: topic);
         final selected = session['selected_files'] as List<dynamic>? ?? [];
         final uploadItems = session['upload_items'] as List<dynamic>? ?? [];
         final peers = session['connected_peers'] as Map<String, dynamic>? ?? {};
@@ -230,32 +230,67 @@ class _SendPageState extends State<SendPage> {
               Text('Preparing', style: Theme.of(context).textTheme.titleMedium),
               ...uploadItems.map((item) {
                 final m = item as Map<String, dynamic>;
-                final status = m['status'] as String? ?? '';
                 return ListTile(
                   dense: true,
                   title: Text(m['name'] as String? ?? ''),
-                  trailing: Text(status),
+                  trailing: Text(m['status'] as String? ?? ''),
                 );
               }),
             ],
             if (topic.isNotEmpty) ...[
               const SizedBox(height: 32),
-              Text('Join code', style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 8),
+              Text('Share code', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 16),
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Theme.of(context).dividerColor),
+                  ),
+                  child: QrImageView(
+                    data: joinUrl,
+                    version: QrVersions.auto,
+                    size: 200,
+                    backgroundColor: Colors.white,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
               SelectableText(
                 topic,
                 style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
               ),
               const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: topic));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Code copied')),
-                  );
-                },
-                icon: const Icon(Icons.copy),
-                label: const Text('Copy code'),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: topic));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Code copied')),
+                        );
+                      },
+                      icon: const Icon(Icons.copy),
+                      label: const Text('Copy code'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: joinUrl));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Link copied')),
+                        );
+                      },
+                      icon: const Icon(Icons.link),
+                      label: const Text('Copy link'),
+                    ),
+                  ),
+                ],
               ),
               if (ui['is_peer_connected'] == true) ...[
                 const SizedBox(height: 16),
@@ -290,6 +325,26 @@ class _ReceivePageState extends State<ReceivePage> {
   final _codeController = TextEditingController();
   bool _busy = false;
 
+  bool get _isMobile =>
+      !kIsWeb && (Platform.isAndroid || Platform.isIOS);
+
+  Future<void> joinWithCode(String code) async {
+    if (!await isValidJoinCode(code: code)) return;
+    setState(() => _busy = true);
+    try {
+      await joinSession(joinCode: code);
+      _codeController.text = code;
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   Future<void> _join() async {
     final raw = _codeController.text.trim();
     final extracted = await extractJoinCode(text: raw);
@@ -302,17 +357,15 @@ class _ReceivePageState extends State<ReceivePage> {
       }
       return;
     }
-    setState(() => _busy = true);
-    try {
-      await joinSession(joinCode: code);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$e')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
+    await joinWithCode(code);
+  }
+
+  Future<void> _scanQr() async {
+    final code = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const QrScanScreen()),
+    );
+    if (code != null) {
+      await joinWithCode(code);
     }
   }
 
@@ -339,8 +392,8 @@ class _ReceivePageState extends State<ReceivePage> {
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<_SessionData>(
-      future: _SessionData.load(),
+    return FutureBuilder<SessionData>(
+      future: SessionData.load(),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator());
@@ -380,6 +433,14 @@ class _ReceivePageState extends State<ReceivePage> {
                 onPressed: _busy ? null : _join,
                 child: const Text('Connect'),
               ),
+              if (_isMobile) ...[
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: _busy ? null : _scanQr,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('Scan QR code'),
+                ),
+              ],
             ],
             if (offers.isNotEmpty) ...[
               const SizedBox(height: 24),

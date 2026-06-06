@@ -39,6 +39,11 @@ impl AlterSendEngine {
         serde_json::to_string(&state).map_err(|e| e.to_string())
     }
 
+    pub async fn can_join_from_deep_link(&self, code: &str) -> bool {
+        let state = self.state.read().await;
+        altersend_domain::can_join_from_deep_link(&state, code)
+    }
+
     async fn dispatch(&self, action: TransferAction) {
         let current = self.state.read().await.clone();
         *self.state.write().await = transfer_session_reducer(current, action);

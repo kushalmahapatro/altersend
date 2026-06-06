@@ -66,5 +66,19 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan a join code QR to receive files.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.altersend.mobile</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.altersend.mobile</string>
+				<string>altersend</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

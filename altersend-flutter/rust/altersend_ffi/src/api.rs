@@ -97,3 +97,16 @@ pub fn is_valid_join_code(code: String) -> bool {
 pub fn extract_join_code(text: String) -> Option<String> {
     altersend_domain::extract_join_code(&text)
 }
+
+#[frb]
+pub fn build_join_url(topic: String) -> String {
+    altersend_domain::build_join_url(&topic)
+}
+
+#[frb]
+pub async fn can_join_from_deep_link(code: String) -> bool {
+    engine()
+        .await
+        .map(|e| e.can_join_from_deep_link(&code))
+        .unwrap_or(false)
+}

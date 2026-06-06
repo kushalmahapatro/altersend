@@ -41,8 +41,11 @@ This mirrors the original stack (`packages/domain` + `packages/core` worklet + a
 | Session state machine (ported reducer) | ✅ |
 | File bytes over P2P (chunked wire protocol) | ✅ |
 | Peer watchdog (receiver timeout) | ✅ |
+| QR code display on send (join URL) | ✅ |
+| QR scan on receive (mobile) | ✅ |
+| Deep links (`altersend://`, `com.altersend.mobile://`) | ✅ |
 | Hyperdrive replication (interop with Electron/RN app) | 🚧 Roadmap |
-| QR scan / deep links / Photos save | 🚧 Platform plugins |
+| Photos library save (mobile) | 🚧 Platform plugins |
 
 ## Prerequisites
 
