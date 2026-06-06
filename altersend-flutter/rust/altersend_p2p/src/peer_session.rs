@@ -1,4 +1,4 @@
-use altersend_mux::{MuxError, PeerMux, PeerMuxBuilder, CHUNK_PROTOCOL, CONTROL_PROTOCOL};
+use altersend_mux::{MuxError, PeerMux, PeerMuxBuilder, RemoteChannelOpen, CHUNK_PROTOCOL, CONTROL_PROTOCOL};
 use bytes::Bytes;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -16,10 +16,15 @@ impl PeerSession {
     pub fn new(
         is_initiator: bool,
         outbound: mpsc::UnboundedSender<Bytes>,
+        on_remote_open: Option<Box<dyn FnMut(RemoteChannelOpen) + Send>>,
     ) -> Result<Self, MuxError> {
         let mut mux = PeerMuxBuilder::new(is_initiator).build();
         mux.attach_outbound(outbound);
+        if let Some(handler) = on_remote_open {
+            mux.set_remote_open_handler(handler);
+        }
         let control_idx = mux.create_channel(CONTROL_PROTOCOL)?;
+        // Legacy peers ignore this; Rust peers use it for file bytes.
         let chunk_idx = mux.create_channel(CHUNK_PROTOCOL)?;
         Ok(Self {
             mux,

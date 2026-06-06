@@ -1,42 +1,66 @@
-# Hyperdrive Interop Plan
+# Legacy AlterSend Peer Interop
 
-The Electron/RN AlterSend worklet transfers file bytes via **Hyperdrive replication** over the same Hyperswarm connection that carries Protomux control messages. The Flutter+Rust app now speaks the same **Protomux control channel** (`altersend/control`) but still moves file bytes over a Rust-only `altersend/chunks` channel until Hyperdrive lands.
+The original AlterSend app (Electron desktop + React Native mobile) transfers file bytes via **Hyperdrive replication** over Hyperswarm connections that also carry Protomux control messages. This Flutter+Rust app targets the same network and control protocol, with incremental wiring for legacy peers.
 
-## Wire stack comparison
+## Wire stack
 
-| Layer | Electron/RN (JS) | Flutter+Rust (today) |
-|-------|------------------|------------------------|
-| Discovery | Hyperswarm + `discoveryKey(topic)` | peeroxide (compatible) |
-| Encryption | Noise (Hyperswarm) | Noise (peeroxide) |
-| Multiplexing | Protomux | Protomux (`altersend_mux`) |
+| Layer | Legacy JS worklet | Flutter+Rust (today) |
+|-------|-------------------|----------------------|
+| Discovery | Hyperswarm + `discoveryKey(topic)` | peeroxide ✅ |
+| Encryption | Noise (Hyperswarm) | Noise (peeroxide) ✅ |
+| Multiplexing | Protomux | `altersend_mux` ✅ |
 | Control | `altersend/control` JSON | `altersend/control` JSON ✅ |
-| File bytes | Hyperdrive → hypercore replication | `altersend/chunks` (Rust peers only) |
+| File bytes | `hypercore/alpha` + Hyperdrive | `altersend/chunks` (Rust peers) |
+
+## Legacy replication channel
+
+JS `corestore.replicate(socket)` attaches Hypercore replication on the shared Protomux mux:
+
+```
+protocol:  "hypercore/alpha"   (alias: "hypercore")
+id:        <32-byte discovery key = BLAKE2b(publicKey)>
+handshake: capability + seeks flag
+messages:  sync, request, data, want, range, …
+```
+
+Flutter+Rust now **detects** when a connected peer opens `hypercore/alpha` and marks the peer as `Legacy`.
 
 ## What works today
 
-- **Rust ↔ Rust**: full transfer via Protomux control + chunk channel.
-- **Rust ↔ JS (partial)**: control messages (`transfer-start`, `transfer-ready`, download events) can flow once both sides complete the Protomux handshake on connect. File bytes still require Hyperdrive.
+| Scenario | Status |
+|----------|--------|
+| Flutter ↔ Flutter (Rust) | Full transfer via control + `altersend/chunks` ✅ |
+| Control messages with legacy peer | `transfer-start`, `transfer-ready`, download telemetry ✅ |
+| Per-topic Noise identity (join) | `identity/topic-keys.json` — JS-compatible ✅ |
+| Legacy peer detection | Opens `hypercore/alpha` → `PeerInteropMode::Legacy` ✅ |
+| Outgoing core registration | Hypercore staged + registered for replication hooks ✅ |
+| Legacy file byte transfer | Requires Hyperdrive + replication wire handler 🔲 |
 
-## Remaining work
+## Implemented setup (this branch)
 
-1. **`corestore.replicate(socket)`** — attach `hypercore-protocol` replication on each peer connection (`altersend_storage::ReplicationHandle`).
-2. **Hyperdrive port** — no official Rust Hyperdrive crate exists. Options:
-   - Port Hyperdrive v13 metadata/content core layout on top of `datrs/hypercore`.
-   - Or embed the JS worklet for replication only (heavier).
-3. **Sender staging** — mirror local files into outgoing Hyperdrive (`MirrorDrive` equivalent) and use real `drive.key` hex in `FileOffer.drive_key` (today it is random).
-4. **Receiver download** — open remote Hyperdrive by `driveKey`, `update({ wait: true })`, stream file to disk.
+1. **`PeerIdentityStore`** — persists per-topic Noise keypairs (`topic-keys.json`), swapped into peeroxide on `join()` like the JS worklet.
+2. **`PeerInteropMode`** — `Rust` vs `Legacy` vs `Unknown`; detected from remote protomux channel opens.
+3. **`ReplicationRegistry`** — tracks outgoing Hypercore public/discovery keys per peer session.
+4. **Sender path** — legacy download-request telemetry is accepted; chunk streaming is skipped (legacy peers pull via replication).
+5. **Receiver path** — downloading from a detected legacy sender returns a clear error until Hyperdrive replication lands.
 
-## Crates added for interop
+## Remaining work for full legacy interop
+
+1. **Hypercore replication wire handler** on `hypercore/alpha` channels (sync/request/data over protomux).
+2. **Hyperdrive port** — stage files into real Hyperdrive metadata/content cores (not bare Hypercore blocks).
+3. **Receiver pull** — open remote Hyperdrive by `driveKey`, replicate, stream to disk (mirror JS `TransferReceiver`).
+4. **Capability handshake** — `caps.replicate(isInitiator, coreKey, handshakeHash)` on channel open.
+
+## Crates
 
 ```
-altersend_mux/      — minimal Protomux (wire-compatible with holepunchto/protomux)
-altersend_storage/  — Corestore layout + hypercore-protocol replication hook
+altersend_mux/      — Protomux (control + hypercore/alpha detection)
+altersend_storage/  — Hypercore staging + replication registry
+altersend_p2p/      — identity store, peer mode, swarm/orchestrator wiring
 ```
 
-## Testing interop
+## Manual interop test (when replication lands)
 
-When Hyperdrive lands, verify:
-
-1. Flutter sender → Electron receiver
-2. Electron sender → Flutter receiver
+1. Flutter sender → legacy receiver
+2. Legacy sender → Flutter receiver
 3. Late-join peer receives replayed `transfer-start` / `transfer-ready`

@@ -20,6 +20,13 @@ pub enum MuxError {
     DuplicateProtocol(String),
 }
 
+pub struct RemoteChannelOpen {
+    pub protocol: String,
+    pub channel_id: Option<Vec<u8>>,
+}
+
+pub type RemoteOpenCallback = Box<dyn FnMut(RemoteChannelOpen) + Send>;
+
 struct RemoteSlot {
     state: Option<Vec<u8>>,
     pending: Vec<(u64, Vec<u8>)>,
@@ -48,6 +55,7 @@ pub struct PeerMux {
     protocol_index: HashMap<String, usize>,
     outbound_tx: Option<mpsc::UnboundedSender<Bytes>>,
     next_local_id: u64,
+    on_remote_open: Option<RemoteOpenCallback>,
 }
 
 impl PeerMux {
@@ -60,7 +68,12 @@ impl PeerMux {
             protocol_index: HashMap::new(),
             outbound_tx: None,
             next_local_id: 1,
+            on_remote_open: None,
         }
+    }
+
+    pub fn set_remote_open_handler(&mut self, handler: RemoteOpenCallback) {
+        self.on_remote_open = Some(handler);
     }
 
     pub fn attach_outbound(&mut self, tx: mpsc::UnboundedSender<Bytes>) {
@@ -173,7 +186,7 @@ impl PeerMux {
             return Ok(());
         }
         let protocol = decode_string(input).ok_or(MuxError::InvalidFrame)?;
-        let _id = decode_optional_buffer(input).ok_or(MuxError::InvalidFrame)?;
+        let channel_id = decode_optional_buffer(input).ok_or(MuxError::InvalidFrame)?;
 
         let rid = remote_id as usize - 1;
         while self.remote.len() <= rid {
@@ -195,6 +208,13 @@ impl PeerMux {
                 session: Some(idx),
             });
             return Ok(());
+        }
+
+        if let Some(handler) = self.on_remote_open.as_mut() {
+            handler(RemoteChannelOpen {
+                protocol: protocol.clone(),
+                channel_id: channel_id.clone(),
+            });
         }
 
         self.remote[rid] = Some(RemoteSlot {

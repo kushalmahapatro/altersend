@@ -9,6 +9,8 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::control::{FileOffer, PeerControlMessage};
+use crate::identity::PeerIdentityStore;
+use crate::peer_mode::PeerInteropMode;
 use crate::swarm::{SwarmHandleClient, SwarmInbound, SwarmRuntime};
 use crate::transfer::{
     build_file_offers, create_transfer_id, is_safe_file_name, offers_to_domain, scan_files,
@@ -76,6 +78,7 @@ struct OrchestratorState {
     file_offers: Vec<FileOffer>,
     downloads: HashMap<String, IncomingDownload>,
     connected_peers: HashSet<String>,
+    peer_modes: HashMap<String, PeerInteropMode>,
     drive: Option<Arc<Mutex<OutgoingDrive>>>,
     drive_key: Option<String>,
 }
@@ -89,12 +92,14 @@ impl TransferOrchestrator {
     pub async fn new(
         event_tx: mpsc::UnboundedSender<EngineEvent>,
         storage_root: PathBuf,
+        identity_root: PathBuf,
         download_dir: PathBuf,
     ) -> Result<Self, peeroxide::SwarmError> {
         let (orch_tx, mut orch_rx) = mpsc::unbounded_channel();
         let (swarm_inbound_tx, mut swarm_inbound_rx) = mpsc::unbounded_channel();
 
         let replication_registry = ReplicationRegistry::new();
+        let identity_store = Arc::new(PeerIdentityStore::new(identity_root));
         let swarm = SwarmRuntime::start(swarm_inbound_tx, replication_registry.clone()).await?;
         let swarm_client = swarm.client.clone();
 
@@ -106,14 +111,15 @@ impl TransferOrchestrator {
             file_offers: Vec::new(),
             downloads: HashMap::new(),
             connected_peers: HashSet::new(),
+            peer_modes: HashMap::new(),
             drive: None,
             drive_key: None,
         }));
 
-        let cmd_tx = orch_tx.clone();
         let event_tx_loop = event_tx.clone();
         let swarm_for_loop = swarm_client.clone();
         let drive_dir = storage_root.join("outgoing-drive");
+        let identity_for_loop = identity_store.clone();
 
         let task = tokio::spawn(async move {
             let mut swarm_client = swarm_for_loop;
@@ -139,6 +145,7 @@ impl TransferOrchestrator {
                             &download_dir,
                             &drive_dir,
                             &replication_registry,
+                            &identity_for_loop,
                             cmd,
                         ).await;
                     }
@@ -194,6 +201,7 @@ async fn handle_command(
     download_dir: &PathBuf,
     drive_dir: &Path,
     replication_registry: &Arc<ReplicationRegistry>,
+    identity_store: &Arc<PeerIdentityStore>,
     cmd: OrchestratorCommand,
 ) {
     match cmd {
@@ -215,6 +223,11 @@ async fn handle_command(
                 drop(guard);
                 set_role(state, event_tx, Some("receiver")).await;
                 emit_status(event_tx, "joining", None, None).await;
+                let key_pair = identity_store
+                    .get_or_create(&topic)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                swarm.recreate_with_keypair(key_pair).await?;
                 swarm.join_topic_hex(&topic).await?;
                 state.lock().await.topic_hex = Some(topic);
                 emit_status(event_tx, "joined", Some(0), None).await;
@@ -266,8 +279,17 @@ async fn handle_swarm_inbound(
             emit_status(event_tx, "peer-connected", Some(count), Some(peer.clone())).await;
             replay_active_transfer(state, swarm).await;
         }
+        SwarmInbound::PeerInteropMode(peer, mode) => {
+            if mode != PeerInteropMode::Unknown {
+                state.lock().await.peer_modes.insert(peer, mode);
+            }
+        }
         SwarmInbound::PeerDisconnected(peer) => {
-            state.lock().await.connected_peers.remove(&peer);
+            {
+                let mut guard = state.lock().await;
+                guard.connected_peers.remove(&peer);
+                guard.peer_modes.remove(&peer);
+            }
             replication_registry.clear_peer(&peer).await;
             let count = swarm.peer_count().await as u32;
             let _ = event_tx.send(EngineEvent::Status {
@@ -358,7 +380,17 @@ async fn handle_control(
             let staged = guard.staged_files.clone();
             let offers = guard.file_offers.clone();
             let drive = guard.drive.clone();
+            let peer_mode = guard
+                .peer_modes
+                .get(&peer)
+                .copied()
+                .unwrap_or(PeerInteropMode::Unknown);
             drop(guard);
+
+            if peer_mode.uses_hypercore_replication() {
+                // Legacy receivers pull file bytes via Hyperdrive / hypercore replication.
+                return;
+            }
 
             let _ = event_tx.send(EngineEvent::PeerDownload {
                 state: "peer-download-started".into(),
@@ -650,6 +682,7 @@ async fn share_files(
 
     let drive_key = drive.key_hex();
     let drive = Arc::new(Mutex::new(drive));
+    replication_registry.set_outgoing_drive(drive.clone()).await;
     let offers = build_file_offers(&transfer_id, &drive_key, &scan.files);
 
     let peers_to_register = {
@@ -657,7 +690,7 @@ async fn share_files(
         guard.transfer_id = Some(transfer_id.clone());
         guard.staged_files = scan.files.clone();
         guard.file_offers = offers.clone();
-        guard.drive = Some(drive);
+        guard.drive = Some(drive.clone());
         guard.drive_key = Some(drive_key.clone());
         guard.connected_peers.iter().cloned().collect::<Vec<_>>()
     };
@@ -707,12 +740,25 @@ async fn download_files(
     download_dir: &PathBuf,
     requests: Vec<DownloadRequest>,
 ) -> Result<(), String> {
-    let transfer_id = state
-        .lock()
-        .await
-        .transfer_id
-        .clone()
-        .unwrap_or_else(create_transfer_id);
+    let (transfer_id, has_legacy_peer) = {
+        let guard = state.lock().await;
+        let transfer_id = guard
+            .transfer_id
+            .clone()
+            .unwrap_or_else(create_transfer_id);
+        let has_legacy_peer = guard
+            .peer_modes
+            .values()
+            .any(|mode| mode.uses_hypercore_replication());
+        (transfer_id, has_legacy_peer)
+    };
+
+    if has_legacy_peer {
+        return Err(
+            "Downloading from legacy AlterSend peers requires Hyperdrive replication (in progress)."
+                .into(),
+        );
+    }
 
     for req in requests {
         if !is_safe_file_name(&req.file_name) {
@@ -771,6 +817,7 @@ async fn disconnect(
     guard.file_offers.clear();
     guard.downloads.clear();
     guard.connected_peers.clear();
+    guard.peer_modes.clear();
     guard.drive = None;
     guard.drive_key = None;
     drop(guard);

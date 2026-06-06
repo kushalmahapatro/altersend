@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use altersend_storage::{ReplicationHandle, ReplicationRegistry};
 use bytes::Bytes;
-use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig, SwarmConnection, SwarmHandle};
+use peeroxide::{discovery_key, spawn, JoinOpts, KeyPair, SwarmConfig, SwarmConnection, SwarmHandle};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::control::{decode_control_payload, PeerControlMessage};
+use crate::peer_mode::{is_hypercore_replication_protocol, PeerInteropMode};
 use crate::peer_session::PeerSession;
 use crate::wire::WireFrame;
 
@@ -18,6 +19,7 @@ pub type PeerKey = String;
 pub enum SwarmInbound {
     PeerConnected(PeerKey),
     PeerDisconnected(PeerKey),
+    PeerInteropMode(PeerKey, PeerInteropMode),
     Frame(PeerKey, WireFrame),
 }
 
@@ -42,6 +44,7 @@ pub struct SwarmHandleClient {
 
 enum SwarmCommand {
     GenerateTopic(oneshot::Sender<Result<String, String>>),
+    RecreateWithKeyPair(KeyPair, oneshot::Sender<Result<(), String>>),
     JoinTopic(String, oneshot::Sender<Result<(), String>>),
     BroadcastControl(PeerControlMessage),
     SendControlToPeer { peer: PeerKey, msg: PeerControlMessage },
@@ -101,6 +104,14 @@ impl SwarmHandleClient {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SwarmCommand::GenerateTopic(tx))
+            .map_err(|_| "swarm stopped".to_string())?;
+        rx.await.map_err(|_| "swarm stopped".to_string())?
+    }
+
+    pub async fn recreate_with_keypair(&self, key_pair: KeyPair) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::RecreateWithKeyPair(key_pair, tx))
             .map_err(|_| "swarm stopped".to_string())?;
         rx.await.map_err(|_| "swarm stopped".to_string())?
     }
@@ -171,7 +182,7 @@ impl SwarmHandleClient {
 }
 
 async fn swarm_actor(
-    handle: SwarmHandle,
+    mut handle: SwarmHandle,
     mut conn_rx: mpsc::Receiver<SwarmConnection>,
     mut cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     inbound_tx: mpsc::UnboundedSender<SwarmInbound>,
@@ -185,6 +196,28 @@ async fn swarm_actor(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
+                    SwarmCommand::RecreateWithKeyPair(key_pair, reply) => {
+                        if let Some(topic) = raw_topic.lock().await.take() {
+                            let discovery = discovery_key(&topic);
+                            let _ = handle.leave(discovery).await;
+                        }
+                        sessions.write().await.clear();
+                        *peer_count.lock().await = 0;
+                        let _ = handle.destroy().await;
+
+                        let mut config = SwarmConfig::with_public_bootstrap();
+                        config.key_pair = Some(key_pair);
+                        match spawn(config).await {
+                            Ok((_task, new_handle, new_conn_rx)) => {
+                                handle = new_handle;
+                                conn_rx = new_conn_rx;
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(err) => {
+                                let _ = reply.send(Err(err.to_string()));
+                            }
+                        }
+                    }
                     SwarmCommand::GenerateTopic(reply) => {
                         let result = async {
                             let mut topic = [0u8; 32];
@@ -266,11 +299,38 @@ async fn swarm_actor(
                 let sessions_read = sessions.clone();
                 let peer_count_read = peer_count.clone();
                 let peer_for_task = peer_key.clone();
+                let replication_registry_peer = replication_registry.clone();
 
                 let mut stream = conn.peer.stream;
                 tokio::spawn(async move {
                     let (mux_out_tx, mut mux_out_rx) = mpsc::unbounded_channel::<Bytes>();
-                    let Ok(mut session) = PeerSession::new(is_initiator, mux_out_tx) else {
+                    let inbound_mode = inbound.clone();
+                    let peer_for_mode = peer_for_task.clone();
+                    let replication_registry_for_open = replication_registry_peer.clone();
+                    let peer_for_replication = peer_for_task.clone();
+                    let on_remote_open = Box::new(move |open: altersend_mux::RemoteChannelOpen| {
+                        let mode =
+                            PeerInteropMode::Unknown.observe_remote_protocol(&open.protocol);
+                        let _ = inbound_mode.send(SwarmInbound::PeerInteropMode(
+                            peer_for_mode.clone(),
+                            mode,
+                        ));
+                        if is_hypercore_replication_protocol(&open.protocol) {
+                            if let Some(id) = open.channel_id {
+                                let discovery = hex::encode(id);
+                                let registry = replication_registry_for_open.clone();
+                                let peer = peer_for_replication.clone();
+                                tokio::spawn(async move {
+                                    let handle =
+                                        ReplicationHandle::attach_peer(&peer, registry);
+                                    handle.on_hypercore_channel_open(&discovery).await;
+                                });
+                            }
+                        }
+                    });
+                    let Ok(mut session) =
+                        PeerSession::new(is_initiator, mux_out_tx, Some(on_remote_open))
+                    else {
                         return;
                     };
 
@@ -293,6 +353,10 @@ async fn swarm_actor(
                         let inbound_chunk = inbound.clone();
                         let peer = peer_for_task.clone();
                         channel.on_json_message(move |value| {
+                            let _ = inbound_chunk.send(SwarmInbound::PeerInteropMode(
+                                peer.clone(),
+                                PeerInteropMode::Rust,
+                            ));
                             if let Some(frame) = decode_chunk_json(&value) {
                                 let _ = inbound_chunk.send(SwarmInbound::Frame(peer.clone(), frame));
                             }
@@ -308,7 +372,12 @@ async fn swarm_actor(
                                         let _ = session.send_control(&msg);
                                     }
                                     Some(PeerCommand::SendChunk { file_id, offset, data }) => {
-                                        let _ = session.send_file_chunk(&file_id, offset, &data);
+                                        if session.send_file_chunk(&file_id, offset, &data).is_ok() {
+                                            let _ = inbound.send(SwarmInbound::PeerInteropMode(
+                                                peer_for_task.clone(),
+                                                PeerInteropMode::Rust,
+                                            ));
+                                        }
                                     }
                                     None => break,
                                 }

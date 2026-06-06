@@ -54,11 +54,14 @@ impl AlterSendEngine {
         std::fs::create_dir_all(&download_dir).ok();
         let outgoing_drive_dir = self.storage_dir.join("outgoing-drive");
         std::fs::create_dir_all(&outgoing_drive_dir).ok();
+        let identity_dir = self.storage_dir.join("identity");
+        std::fs::create_dir_all(&identity_dir).ok();
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let orchestrator = TransferOrchestrator::new(
             event_tx,
             self.storage_dir.clone(),
+            identity_dir,
             download_dir,
         )
             .await
