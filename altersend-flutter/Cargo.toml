@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "rust/altersend_domain",
+    "rust/altersend_mux",
+    "rust/altersend_storage",
     "rust/altersend_p2p",
     "rust/altersend_engine",
     "rust/altersend_ffi",

@@ -2,6 +2,7 @@
 
 mod control;
 mod orchestrator;
+mod peer_session;
 mod swarm;
 mod transfer;
 mod wire;

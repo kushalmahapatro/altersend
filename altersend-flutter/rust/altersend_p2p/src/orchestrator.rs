@@ -13,7 +13,7 @@ use crate::transfer::{
     build_file_offers, create_transfer_id, is_safe_file_name, offers_to_domain, scan_files,
     IncomingDownload, ScannedFile,
 };
-use crate::wire::{encode_control_frame, encode_file_chunk_frame, WireFrame};
+use crate::wire::{encode_control_frame, WireFrame};
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -519,11 +519,14 @@ async fn send_file_to_peer(
     use crate::transfer::send_file_chunks;
 
     send_file_chunks(path, total_size, |offset, chunk| {
-        let frame = encode_file_chunk_frame(file_id, offset, chunk);
         let swarm = swarm.clone();
         let peer = peer.to_string();
+        let file_id = file_id.to_string();
+        let data = chunk.to_vec();
         async move {
-            swarm.send_to_peer(&peer, frame).await;
+            swarm
+                .send_chunk_to_peer(&peer, &file_id, offset, data)
+                .await;
             Ok(())
         }
     })

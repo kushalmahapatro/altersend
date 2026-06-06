@@ -24,7 +24,10 @@ A reimplementation of [AlterSend](https://github.com/denislupookov/altersend) wi
 └──────────────────┬──────────────────────┘
 ┌──────────────────▼──────────────────────┐
 │  altersend_p2p                            │
-│  peeroxide (Hyperswarm) · control channel │
+│  peeroxide · protomux · chunked transfer  │
+├───────────────────────────────────────────┤
+│  altersend_mux · altersend_storage        │
+│  Protomux framing · hypercore hook        │
 └───────────────────────────────────────────┘
 ```
 
@@ -47,7 +50,9 @@ This mirrors the original stack (`packages/domain` + `packages/core` worklet + a
 | Onboarding slides (first launch) | ✅ |
 | Mobile photo picker (send) | ✅ |
 | Photos library save on receive (mobile) | ✅ |
-| Hyperdrive replication (interop with Electron/RN app) | 🚧 Roadmap |
+| Protomux control channel (`altersend/control`) | ✅ |
+| Hypercore replication hook on peer connect | 🚧 Scaffolded |
+| Hyperdrive file replication (interop with Electron/RN app) | 🚧 Roadmap |
 
 ## Prerequisites
 
@@ -79,6 +84,8 @@ altersend-flutter/
 ├── app/                    # Flutter UI (thin)
 ├── rust/
 │   ├── altersend_domain/   # Business logic (reducer, join code, page copy)
+│   ├── altersend_mux/      # Protomux multiplexing (JS wire-compatible)
+│   ├── altersend_storage/  # Corestore layout + replication hook
 │   ├── altersend_p2p/      # P2P orchestrator + peeroxide swarm
 │   ├── altersend_engine/   # Wires domain + P2P; command API
 │   └── altersend_ffi/      # flutter_rust_bridge exports

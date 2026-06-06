@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use altersend_storage::ReplicationHandle;
+use bytes::Bytes;
 use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig, SwarmConnection, SwarmHandle};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::wire::{drain_frames, WireFrame};
+use crate::control::{decode_control_payload, PeerControlMessage};
+use crate::peer_session::PeerSession;
+use crate::wire::WireFrame;
 
 pub type PeerKey = String;
 
@@ -17,8 +21,17 @@ pub enum SwarmInbound {
     Frame(PeerKey, WireFrame),
 }
 
-struct PeerOutbound {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+struct PeerHandle {
+    cmd_tx: mpsc::UnboundedSender<PeerCommand>,
+}
+
+enum PeerCommand {
+    SendControl(PeerControlMessage),
+    SendChunk {
+        file_id: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
 }
 
 /// Handle to the background Hyperswarm actor (non-blocking).
@@ -30,8 +43,14 @@ pub struct SwarmHandleClient {
 enum SwarmCommand {
     GenerateTopic(oneshot::Sender<Result<String, String>>),
     JoinTopic(String, oneshot::Sender<Result<(), String>>),
-    Broadcast(Vec<u8>),
-    SendToPeer { peer: PeerKey, data: Vec<u8> },
+    BroadcastControl(PeerControlMessage),
+    SendControlToPeer { peer: PeerKey, msg: PeerControlMessage },
+    SendChunkToPeer {
+        peer: PeerKey,
+        file_id: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
     PeerCount(oneshot::Sender<usize>),
     EndSession(oneshot::Sender<()>),
     Destroy(oneshot::Sender<()>),
@@ -48,7 +67,7 @@ impl SwarmRuntime {
         let (_join_handle, swarm, conn_rx) = spawn(config).await?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let sessions: Arc<RwLock<HashMap<PeerKey, PeerOutbound>>> =
+        let sessions: Arc<RwLock<HashMap<PeerKey, PeerHandle>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let peer_count = Arc::new(Mutex::new(0usize));
         let raw_topic: Arc<Mutex<Option<[u8; 32]>>> = Arc::new(Mutex::new(None));
@@ -90,15 +109,40 @@ impl SwarmHandleClient {
         rx.await.map_err(|_| "swarm stopped".to_string())?
     }
 
-    pub async fn broadcast_bytes(&self, data: Vec<u8>) {
-        let _ = self.cmd_tx.send(SwarmCommand::Broadcast(data));
+    pub async fn broadcast_control(&self, msg: &PeerControlMessage) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::BroadcastControl(msg.clone()));
     }
 
-    pub async fn send_to_peer(&self, peer: &str, data: Vec<u8>) {
-        let _ = self.cmd_tx.send(SwarmCommand::SendToPeer {
+    pub async fn send_control_to_peer(&self, peer: &str, msg: &PeerControlMessage) {
+        let _ = self.cmd_tx.send(SwarmCommand::SendControlToPeer {
             peer: peer.to_string(),
+            msg: msg.clone(),
+        });
+    }
+
+    pub async fn send_chunk_to_peer(&self, peer: &str, file_id: &str, offset: u64, data: Vec<u8>) {
+        let _ = self.cmd_tx.send(SwarmCommand::SendChunkToPeer {
+            peer: peer.to_string(),
+            file_id: file_id.to_string(),
+            offset,
             data,
         });
+    }
+
+    /// Legacy helper — encodes a control message and broadcasts via Protomux.
+    pub async fn broadcast_bytes(&self, data: Vec<u8>) {
+        if let Some(msg) = decode_control_payload(&data) {
+            self.broadcast_control(&msg).await;
+        }
+    }
+
+    /// Legacy helper — sends encoded control to one peer via Protomux.
+    pub async fn send_to_peer(&self, peer: &str, data: Vec<u8>) {
+        if let Some(msg) = decode_control_payload(&data) {
+            self.send_control_to_peer(peer, &msg).await;
+        }
     }
 
     pub async fn peer_count(&self) -> usize {
@@ -127,7 +171,7 @@ async fn swarm_actor(
     mut conn_rx: mpsc::Receiver<SwarmConnection>,
     mut cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     inbound_tx: mpsc::UnboundedSender<SwarmInbound>,
-    sessions: Arc<RwLock<HashMap<PeerKey, PeerOutbound>>>,
+    sessions: Arc<RwLock<HashMap<PeerKey, PeerHandle>>>,
     peer_count: Arc<Mutex<usize>>,
     raw_topic: Arc<Mutex<Option<[u8; 32]>>>,
 ) {
@@ -152,16 +196,22 @@ async fn swarm_actor(
                         }.await;
                         let _ = reply.send(result);
                     }
-                    SwarmCommand::Broadcast(data) => {
+                    SwarmCommand::BroadcastControl(msg) => {
                         let guard = sessions.read().await;
                         for peer in guard.values() {
-                            let _ = peer.tx.send(data.clone());
+                            let _ = peer.cmd_tx.send(PeerCommand::SendControl(msg.clone()));
                         }
                     }
-                    SwarmCommand::SendToPeer { peer, data } => {
+                    SwarmCommand::SendControlToPeer { peer, msg } => {
                         let guard = sessions.read().await;
                         if let Some(p) = guard.get(&peer) {
-                            let _ = p.tx.send(data);
+                            let _ = p.cmd_tx.send(PeerCommand::SendControl(msg));
+                        }
+                    }
+                    SwarmCommand::SendChunkToPeer { peer, file_id, offset, data } => {
+                        let guard = sessions.read().await;
+                        if let Some(p) = guard.get(&peer) {
+                            let _ = p.cmd_tx.send(PeerCommand::SendChunk { file_id, offset, data });
                         }
                     }
                     SwarmCommand::PeerCount(reply) => {
@@ -191,16 +241,19 @@ async fn swarm_actor(
             conn = conn_rx.recv() => {
                 let Some(conn) = conn else { continue };
                 let peer_key = hex::encode(conn.remote_public_key());
+                let is_initiator = conn.is_initiator;
+                let _replication = ReplicationHandle::attach_peer(&peer_key, is_initiator);
+
                 {
                     let mut count = peer_count.lock().await;
                     *count += 1;
                 }
                 let _ = inbound_tx.send(SwarmInbound::PeerConnected(peer_key.clone()));
 
-                let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+                let (peer_cmd_tx, mut peer_cmd_rx) = mpsc::unbounded_channel();
                 sessions.write().await.insert(
                     peer_key.clone(),
-                    PeerOutbound { tx: out_tx },
+                    PeerHandle { cmd_tx: peer_cmd_tx },
                 );
 
                 let inbound = inbound_tx.clone();
@@ -210,10 +263,51 @@ async fn swarm_actor(
 
                 let mut stream = conn.peer.stream;
                 tokio::spawn(async move {
-                    let mut buffer = Vec::new();
+                    let (mux_out_tx, mut mux_out_rx) = mpsc::unbounded_channel::<Bytes>();
+                    let Ok(mut session) = PeerSession::new(is_initiator, mux_out_tx) else {
+                        return;
+                    };
+
+                    if let Some(channel) = session.mux.channel_mut(session.control_idx) {
+                        let inbound_ctrl = inbound.clone();
+                        let peer = peer_for_task.clone();
+                        channel.on_json_message(move |value| {
+                            if let Ok(bytes) = serde_json::to_vec(&value) {
+                                if let Some(msg) = decode_control_payload(&bytes) {
+                                    let _ = inbound_ctrl.send(SwarmInbound::Frame(
+                                        peer.clone(),
+                                        WireFrame::Control(msg),
+                                    ));
+                                }
+                            }
+                        });
+                    }
+
+                    if let Some(channel) = session.mux.channel_mut(session.chunk_idx) {
+                        let inbound_chunk = inbound.clone();
+                        let peer = peer_for_task.clone();
+                        channel.on_json_message(move |value| {
+                            if let Some(frame) = decode_chunk_json(&value) {
+                                let _ = inbound_chunk.send(SwarmInbound::Frame(peer.clone(), frame));
+                            }
+                        });
+                    }
+
+                    let mut read_buffer = Vec::new();
                     loop {
                         tokio::select! {
-                            out = out_rx.recv() => {
+                            cmd = peer_cmd_rx.recv() => {
+                                match cmd {
+                                    Some(PeerCommand::SendControl(msg)) => {
+                                        let _ = session.send_control(&msg);
+                                    }
+                                    Some(PeerCommand::SendChunk { file_id, offset, data }) => {
+                                        let _ = session.send_file_chunk(&file_id, offset, &data);
+                                    }
+                                    None => break,
+                                }
+                            }
+                            out = mux_out_rx.recv() => {
                                 match out {
                                     Some(bytes) => {
                                         if stream.write(&bytes).await.is_err() {
@@ -226,12 +320,11 @@ async fn swarm_actor(
                             read = stream.read() => {
                                 match read {
                                     Ok(Some(chunk)) => {
-                                        buffer.extend_from_slice(&chunk);
-                                        for frame in drain_frames(&mut buffer) {
-                                            let _ = inbound.send(SwarmInbound::Frame(
-                                                peer_for_task.clone(),
-                                                frame,
-                                            ));
+                                        read_buffer.extend_from_slice(&chunk);
+                                        if let Err(err) = session.ingest(&read_buffer) {
+                                            warn!("protomux ingest: {err}");
+                                        } else {
+                                            read_buffer.clear();
                                         }
                                     }
                                     Ok(None) => break,
@@ -253,6 +346,13 @@ async fn swarm_actor(
             }
         }
     }
+}
+
+fn decode_chunk_json(value: &serde_json::Value) -> Option<WireFrame> {
+    let hex_payload = value.get("payload")?.as_str()?;
+    let bytes = hex::decode(hex_payload).ok()?;
+    let mut buf = bytes;
+    crate::wire::drain_frames(&mut buf).into_iter().next()
 }
 
 async fn join_raw_topic(
