@@ -132,6 +132,27 @@ impl OutgoingDrive {
     pub fn core_length(&self) -> u64 {
         self.core.info().length
     }
+
+    pub fn core_info(&self) -> hypercore::Info {
+        self.core.info()
+    }
+
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.core.key_pair().public.to_bytes()
+    }
+
+    pub async fn create_proof(
+        &mut self,
+        block: Option<hypercore_schema::RequestBlock>,
+        hash: Option<hypercore_schema::RequestBlock>,
+        seek: Option<hypercore_schema::RequestSeek>,
+        upgrade: Option<hypercore_schema::RequestUpgrade>,
+    ) -> Result<Option<hypercore_schema::Proof>, DriveError> {
+        Ok(self
+            .core
+            .create_proof(block, hash, seek, upgrade)
+            .await?)
+    }
 }
 
 #[cfg(test)]

@@ -34,7 +34,8 @@ Flutter+Rust now **detects** when a connected peer opens `hypercore/alpha` and m
 | Per-topic Noise identity (join) | `identity/topic-keys.json` — JS-compatible ✅ |
 | Legacy peer detection | Opens `hypercore/alpha` → `PeerInteropMode::Legacy` ✅ |
 | Outgoing core registration | Hypercore staged + registered for replication hooks ✅ |
-| Legacy file byte transfer | Requires Hyperdrive + replication wire handler 🔲 |
+| Legacy file byte transfer (sender) | Hypercore replication wire handler serves staged blocks ✅ |
+| Legacy file byte transfer (receiver) | Requires Hyperdrive port + receiver pull 🔲 |
 
 ## Implemented setup (this branch)
 

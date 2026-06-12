@@ -6,7 +6,10 @@ license.workspace = true
 
 [dependencies]
 altersend_mux = { path = "../altersend_mux" }
+blake2 = "0.10"
+compact-encoding = "2.2"
 hex = { workspace = true }
+hypercore_schema = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

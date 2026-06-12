@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use altersend_mux::PeerMux;
+use tokio::sync::{mpsc, RwLock};
+use tracing::info;
 
 use crate::drive::OutgoingDrive;
+use crate::replication::{HypercoreReplicationPeer, ReplicationOutbound};
 
 /// Local Hypercore registered for outgoing replication to legacy peers.
 #[derive(Clone)]
@@ -66,6 +68,10 @@ impl ReplicationRegistry {
         self.registered_cores.read().await.values().cloned().collect()
     }
 
+    pub async fn outgoing_drive(&self) -> Option<Arc<tokio::sync::Mutex<OutgoingDrive>>> {
+        self.outgoing_drive.read().await.clone()
+    }
+
     pub async fn set_active_drive(&self, peer_key: &str, drive_key_hex: &str) {
         self.active_drive_keys
             .write()
@@ -98,24 +104,51 @@ impl ReplicationHandle {
         }
     }
 
-    pub async fn on_hypercore_channel_open(&self, discovery_key_hex: &str) {
-        if self
+    pub async fn attach_hypercore_channel(
+        &self,
+        mux: &mut PeerMux,
+        remote_id: u64,
+        discovery_key_hex: &str,
+        handshake: &[u8],
+        local_is_initiator: bool,
+        handshake_hash: &[u8; 64],
+        outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
+    ) -> Result<(), String> {
+        let core = self
             .registry
             .registered_core_for_discovery(discovery_key_hex)
             .await
-            .is_some()
-        {
-            info!(
-                "legacy peer {} opened hypercore/alpha for local core {}",
-                self.peer_key, discovery_key_hex
-            );
-            return;
-        }
+            .ok_or_else(|| format!("unknown discovery key {discovery_key_hex}"))?;
 
-        warn!(
-            "legacy peer {} opened hypercore/alpha for unknown discovery key {}",
+        let drive = self
+            .registry
+            .outgoing_drive()
+            .await
+            .ok_or_else(|| "no outgoing drive staged".to_string())?;
+
+        let public_key = hex::decode(&core.public_key_hex)
+            .map_err(|_| "invalid core public key".to_string())?;
+        if public_key.len() != 32 {
+            return Err("core public key must be 32 bytes".into());
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&public_key);
+
+        info!(
+            "legacy peer {} opened hypercore/alpha for local core {}",
             self.peer_key, discovery_key_hex
         );
+
+        HypercoreReplicationPeer::attach(
+            mux,
+            remote_id,
+            handshake,
+            local_is_initiator,
+            handshake_hash,
+            key,
+            drive,
+            outbound_tx,
+        )
     }
 
     pub async fn detach(self) {

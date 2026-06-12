@@ -7,7 +7,11 @@
 mod corestore;
 mod drive;
 mod replicate;
+mod replication;
 
 pub use corestore::CoreStore;
 pub use drive::{OutgoingDrive, StagedFileMeta, CHUNK_SIZE as DRIVE_CHUNK_SIZE};
 pub use replicate::{ReplicationHandle, ReplicationRegistry};
+pub use replication::{
+    send_replication_outbound, HypercoreReplicationPeer, ReplicationOutbound,
+};

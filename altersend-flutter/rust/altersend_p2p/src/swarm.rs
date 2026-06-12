@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use altersend_storage::{ReplicationHandle, ReplicationRegistry};
+use altersend_storage::{
+    send_replication_outbound, ReplicationHandle, ReplicationRegistry, ReplicationOutbound,
+};
 use bytes::Bytes;
 use peeroxide::{discovery_key, spawn, JoinOpts, KeyPair, SwarmConfig, SwarmConnection, SwarmHandle};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -14,6 +16,12 @@ use crate::peer_session::PeerSession;
 use crate::wire::WireFrame;
 
 pub type PeerKey = String;
+
+struct HypercoreChannelOpen {
+    remote_id: u64,
+    discovery_key_hex: String,
+    handshake: Vec<u8>,
+}
 
 #[derive(Debug, Clone)]
 pub enum SwarmInbound {
@@ -280,9 +288,6 @@ async fn swarm_actor(
                 let Some(conn) = conn else { continue };
                 let peer_key = hex::encode(conn.remote_public_key());
                 let is_initiator = conn.is_initiator;
-                let replication =
-                    ReplicationHandle::attach_peer(&peer_key, replication_registry.clone());
-
                 {
                     let mut count = peer_count.lock().await;
                     *count += 1;
@@ -302,12 +307,16 @@ async fn swarm_actor(
                 let replication_registry_peer = replication_registry.clone();
 
                 let mut stream = conn.peer.stream;
+                let handshake_hash = *stream.handshake_hash();
                 tokio::spawn(async move {
                     let (mux_out_tx, mut mux_out_rx) = mpsc::unbounded_channel::<Bytes>();
+                    let (hc_open_tx, mut hc_open_rx) =
+                        mpsc::unbounded_channel::<HypercoreChannelOpen>();
+                    let (repl_out_tx, mut repl_out_rx) =
+                        mpsc::unbounded_channel::<ReplicationOutbound>();
                     let inbound_mode = inbound.clone();
                     let peer_for_mode = peer_for_task.clone();
                     let replication_registry_for_open = replication_registry_peer.clone();
-                    let peer_for_replication = peer_for_task.clone();
                     let on_remote_open = Box::new(move |open: altersend_mux::RemoteChannelOpen| {
                         let mode =
                             PeerInteropMode::Unknown.observe_remote_protocol(&open.protocol);
@@ -317,13 +326,10 @@ async fn swarm_actor(
                         ));
                         if is_hypercore_replication_protocol(&open.protocol) {
                             if let Some(id) = open.channel_id {
-                                let discovery = hex::encode(id);
-                                let registry = replication_registry_for_open.clone();
-                                let peer = peer_for_replication.clone();
-                                tokio::spawn(async move {
-                                    let handle =
-                                        ReplicationHandle::attach_peer(&peer, registry);
-                                    handle.on_hypercore_channel_open(&discovery).await;
+                                let _ = hc_open_tx.send(HypercoreChannelOpen {
+                                    remote_id: open.remote_id,
+                                    discovery_key_hex: hex::encode(id),
+                                    handshake: open.handshake,
                                 });
                             }
                         }
@@ -364,8 +370,37 @@ async fn swarm_actor(
                     }
 
                     let mut read_buffer = Vec::new();
+                    let replication_handle =
+                        ReplicationHandle::attach_peer(&peer_for_task, replication_registry_for_open);
                     loop {
                         tokio::select! {
+                            hc_open = hc_open_rx.recv() => {
+                                if let Some(open) = hc_open {
+                                    if let Err(err) = replication_handle.attach_hypercore_channel(
+                                        &mut session.mux,
+                                        open.remote_id,
+                                        &open.discovery_key_hex,
+                                        &open.handshake,
+                                        is_initiator,
+                                        &handshake_hash,
+                                        repl_out_tx.clone(),
+                                    ).await {
+                                        warn!(
+                                            "hypercore/alpha attach for {}: {err}",
+                                            open.discovery_key_hex
+                                        );
+                                    }
+                                }
+                            }
+                            repl_out = repl_out_rx.recv() => {
+                                if let Some(outbound) = repl_out {
+                                    if let Err(err) =
+                                        send_replication_outbound(&mut session.mux, outbound)
+                                    {
+                                        warn!("hypercore replication send: {err}");
+                                    }
+                                }
+                            }
                             cmd = peer_cmd_rx.recv() => {
                                 match cmd {
                                     Some(PeerCommand::SendControl(msg)) => {
@@ -416,7 +451,7 @@ async fn swarm_actor(
                         let mut count = peer_count_read.lock().await;
                         *count = count.saturating_sub(1);
                     }
-                    replication.detach().await;
+                    replication_handle.detach().await;
                     let _ = inbound.send(SwarmInbound::PeerDisconnected(peer_for_task));
                 });
             }

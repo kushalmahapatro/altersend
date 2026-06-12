@@ -147,9 +147,12 @@ name = "altersend_storage"
 version = "0.1.0"
 dependencies = [
  "altersend_mux",
+ "blake2",
+ "compact-encoding",
  "hex",
  "hypercore",
  "hypercore-protocol",
+ "hypercore_schema",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

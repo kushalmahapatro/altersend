@@ -9,7 +9,9 @@ mod codec;
 mod session;
 
 pub use channel::{Channel, MessageHandle};
-pub use session::{MuxError, PeerMux, PeerMuxBuilder, RemoteChannelOpen};
+pub use session::{
+    BinaryMessageCallback, MuxError, PeerMux, PeerMuxBuilder, RemoteChannelOpen,
+};
 
 pub const CONTROL_PROTOCOL: &str = "altersend/control";
 pub const CHUNK_PROTOCOL: &str = "altersend/chunks";

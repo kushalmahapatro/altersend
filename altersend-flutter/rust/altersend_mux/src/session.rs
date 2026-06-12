@@ -6,8 +6,9 @@ use tokio::sync::mpsc;
 
 use crate::channel::Channel;
 use crate::codec::{
-    decode_buffer, decode_optional_buffer, decode_string, decode_uint, encode_channel_message,
-    encode_control_frame, encode_optional_buffer, encode_string, encode_uint,
+    decode_buffer, decode_optional_buffer, decode_string, decode_uint, encode_buffer,
+    encode_channel_message, encode_control_frame, encode_optional_buffer, encode_string,
+    encode_uint,
 };
 
 #[derive(Debug, Error)]
@@ -21,16 +22,21 @@ pub enum MuxError {
 }
 
 pub struct RemoteChannelOpen {
+    pub remote_id: u64,
     pub protocol: String,
     pub channel_id: Option<Vec<u8>>,
+    /// Protomux channel handshake bytes (e.g. hypercore `{ seeks, capability }`).
+    pub handshake: Vec<u8>,
 }
 
 pub type RemoteOpenCallback = Box<dyn FnMut(RemoteChannelOpen) + Send>;
+pub type BinaryMessageCallback = Box<dyn FnMut(u64, &[u8]) + Send>;
 
 struct RemoteSlot {
     state: Option<Vec<u8>>,
     pending: Vec<(u64, Vec<u8>)>,
     session: Option<usize>,
+    binary_handler: Option<BinaryMessageCallback>,
 }
 
 pub struct PeerMuxBuilder {
@@ -111,6 +117,39 @@ impl PeerMux {
 
     pub fn channel_mut(&mut self, idx: usize) -> Option<&mut Channel> {
         self.local.get_mut(idx).and_then(|c| c.as_mut())
+    }
+
+    /// Send a binary message on a channel opened by the remote peer.
+    pub fn send_on_remote(
+        &mut self,
+        remote_id: u64,
+        msg_type: u64,
+        payload: &[u8],
+    ) -> Result<(), MuxError> {
+        let mut body = BytesMut::new();
+        encode_buffer(payload, &mut body);
+        let frame = encode_channel_message(remote_id, msg_type, &mut body);
+        self.write_frame(frame)
+    }
+
+    pub fn set_remote_binary_handler(
+        &mut self,
+        remote_id: u64,
+        handler: BinaryMessageCallback,
+    ) -> Result<(), MuxError> {
+        let rid = remote_id as usize - 1;
+        let slot = self
+            .remote
+            .get_mut(rid)
+            .and_then(|s| s.as_mut())
+            .ok_or(MuxError::ChannelNotOpen)?;
+        slot.binary_handler = Some(handler);
+        for (msg_type, payload) in slot.pending.drain(..) {
+            if let Some(handler) = slot.binary_handler.as_mut() {
+                handler(msg_type, &payload);
+            }
+        }
+        Ok(())
     }
 
     pub fn send_json(&mut self, idx: usize, value: serde_json::Value) -> Result<(), MuxError> {
@@ -206,14 +245,17 @@ impl PeerMux {
                 state: None,
                 pending: Vec::new(),
                 session: Some(idx),
+                binary_handler: None,
             });
             return Ok(());
         }
 
         if let Some(handler) = self.on_remote_open.as_mut() {
             handler(RemoteChannelOpen {
+                remote_id,
                 protocol: protocol.clone(),
                 channel_id: channel_id.clone(),
+                handshake: handshake.clone(),
             });
         }
 
@@ -221,6 +263,7 @@ impl PeerMux {
             state: Some(handshake),
             pending: Vec::new(),
             session: None,
+            binary_handler: None,
         });
         Ok(())
     }
@@ -251,20 +294,27 @@ impl PeerMux {
     fn handle_channel_message(
         &mut self,
         remote_id: u64,
-        _msg_type: u64,
+        msg_type: u64,
         payload: &[u8],
     ) -> Result<(), MuxError> {
         let rid = remote_id as usize - 1;
-        let slot = self
-            .remote
-            .get(rid)
-            .and_then(|s| s.as_ref())
-            .ok_or(MuxError::InvalidFrame)?;
+        let Some(slot) = self.remote.get_mut(rid).and_then(|s| s.as_mut()) else {
+            return Err(MuxError::InvalidFrame);
+        };
 
-        let idx = slot.session.ok_or(MuxError::InvalidFrame)?;
-        if let Some(channel) = self.local.get_mut(idx).and_then(|c| c.as_mut()) {
-            channel.recv_json(payload);
+        if let Some(idx) = slot.session {
+            if let Some(channel) = self.local.get_mut(idx).and_then(|c| c.as_mut()) {
+                channel.recv_json(payload);
+            }
+            return Ok(());
         }
+
+        if let Some(handler) = slot.binary_handler.as_mut() {
+            handler(msg_type, payload);
+            return Ok(());
+        }
+
+        slot.pending.push((msg_type, payload.to_vec()));
         Ok(())
     }
 
