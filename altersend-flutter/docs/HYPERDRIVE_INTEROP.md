@@ -35,7 +35,7 @@ Flutter+Rust now **detects** when a connected peer opens `hypercore/alpha` and m
 | Legacy peer detection | Opens `hypercore/alpha` → `PeerInteropMode::Legacy` ✅ |
 | Outgoing core registration | Hypercore staged + registered for replication hooks ✅ |
 | Legacy file byte transfer (sender) | Hypercore replication wire handler serves staged blocks ✅ |
-| Legacy file byte transfer (receiver) | Requires Hyperdrive port + receiver pull 🔲 |
+| Legacy file byte transfer (receiver) | Hyperdrive pull path: replicate metadata+blobs, read via hyperbee scan ✅ (needs outgoing Hyperdrive sender) |
 
 ## Implemented setup (this branch)
 
@@ -43,25 +43,25 @@ Flutter+Rust now **detects** when a connected peer opens `hypercore/alpha` and m
 2. **`PeerInteropMode`** — `Rust` vs `Legacy` vs `Unknown`; detected from remote protomux channel opens.
 3. **`ReplicationRegistry`** — tracks outgoing Hypercore public/discovery keys per peer session.
 4. **Sender path** — legacy download-request telemetry is accepted; chunk streaming is skipped (legacy peers pull via replication).
-5. **Receiver path** — downloading from a detected legacy sender returns a clear error until Hyperdrive replication lands.
+5. **Receiver path** — when a legacy sender is detected, opens `IncomingHyperdrive` by `driveKey`, registers metadata+blobs cores for download replication, proactively opens `hypercore/alpha` channels, and reads the file via hyperbee scan + blob blocks.
+6. **`HypercoreReplicationClient`** — download-side replication (sync/request/data apply) for incoming cores.
+7. **`IncomingHyperdrive`** — minimal hyperbee reader: path lookup, header content-key → blobs core, `read_file()`.
 
 ## Remaining work for full legacy interop
 
-1. **Hypercore replication wire handler** on `hypercore/alpha` channels (sync/request/data over protomux).
-2. **Hyperdrive port** — stage files into real Hyperdrive metadata/content cores (not bare Hypercore blocks).
-3. **Receiver pull** — open remote Hyperdrive by `driveKey`, replicate, stream to disk (mirror JS `TransferReceiver`).
-4. **Capability handshake** — `caps.replicate(isInitiator, coreKey, handshakeHash)` on channel open.
+1. **Outgoing Hyperdrive port** — stage files into real Hyperdrive metadata/content cores (not bare Hypercore blocks) so legacy receivers can pull by `driveKey`.
+2. **End-to-end manual interop** — Flutter sender → legacy receiver and legacy sender → Flutter receiver on real devices.
 
 ## Crates
 
 ```
 altersend_mux/      — Protomux (control + hypercore/alpha detection)
-altersend_storage/  — Hypercore staging + replication registry
+altersend_storage/  — Hypercore staging, replication registry, IncomingHyperdrive reader
 altersend_p2p/      — identity store, peer mode, swarm/orchestrator wiring
 ```
 
-## Manual interop test (when replication lands)
+## Manual interop test
 
-1. Flutter sender → legacy receiver
-2. Legacy sender → Flutter receiver
+1. Legacy sender → Flutter receiver (receiver pull path implemented; verify on device)
+2. Flutter sender → legacy receiver (blocked until outgoing Hyperdrive port)
 3. Late-join peer receives replayed `transfer-start` / `transfer-ready`

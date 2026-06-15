@@ -26,6 +26,27 @@ pub fn decode_handshake(data: &[u8]) -> Option<(bool, [u8; 32])> {
     Some(((flags & 1) != 0, capability))
 }
 
+/// Capability we send when locally opening a hypercore replication channel.
+pub fn local_capability(
+    local_is_initiator: bool,
+    core_public_key: &[u8; 32],
+    handshake_hash: &[u8; 64],
+) -> [u8; 32] {
+    replicate_capability(local_is_initiator, core_public_key, handshake_hash)
+}
+
+/// Encode protomux hypercore handshake `{ seeks, capability }`.
+pub fn encode_handshake(seeks: bool, capability: &[u8; 32]) -> Vec<u8> {
+    use compact_encoding::CompactEncoding;
+    let flags = if seeks { 1u64 } else { 0u64 };
+    let size = flags.encoded_size().unwrap();
+    let mut buf = Vec::with_capacity(size + 32);
+    buf.resize(size, 0);
+    flags.encode(&mut buf).unwrap();
+    buf.extend_from_slice(capability);
+    buf
+}
+
 /// Expected remote capability for a hypercore public key.
 pub fn expected_remote_capability(
     local_is_initiator: bool,

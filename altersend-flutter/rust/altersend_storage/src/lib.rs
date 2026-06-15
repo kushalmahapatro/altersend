@@ -6,12 +6,15 @@
 
 mod corestore;
 mod drive;
+mod hyperdrive;
 mod replicate;
 mod replication;
 
 pub use corestore::CoreStore;
 pub use drive::{OutgoingDrive, StagedFileMeta, CHUNK_SIZE as DRIVE_CHUNK_SIZE};
-pub use replicate::{ReplicationHandle, ReplicationRegistry};
+pub use hyperdrive::{IncomingHyperdrive, IncomingHyperdriveError};
+pub use replicate::{ReplicationHandle, ReplicationRegistry, RegisteredCore};
 pub use replication::{
-    send_replication_outbound, HypercoreReplicationPeer, ReplicationOutbound,
+    encode_handshake, local_capability, send_replication_outbound, HypercoreReplicationClient,
+    HypercoreReplicationPeer, ReplicationOutbound,
 };

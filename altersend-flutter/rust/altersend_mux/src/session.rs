@@ -62,6 +62,7 @@ pub struct PeerMux {
     outbound_tx: Option<mpsc::UnboundedSender<Bytes>>,
     next_local_id: u64,
     on_remote_open: Option<RemoteOpenCallback>,
+    local_binary_handlers: HashMap<u64, BinaryMessageCallback>,
 }
 
 impl PeerMux {
@@ -75,6 +76,7 @@ impl PeerMux {
             outbound_tx: None,
             next_local_id: 1,
             on_remote_open: None,
+            local_binary_handlers: HashMap::new(),
         }
     }
 
@@ -111,7 +113,7 @@ impl PeerMux {
         self.local[idx] = Some(channel);
         self.protocol_index.insert(protocol.to_string(), idx);
 
-        self.send_open(local_id, protocol, None)?;
+        self.send_open(local_id, protocol, None, &[])?;
         Ok(idx)
     }
 
@@ -119,17 +121,57 @@ impl PeerMux {
         self.local.get_mut(idx).and_then(|c| c.as_mut())
     }
 
-    /// Send a binary message on a channel opened by the remote peer.
-    pub fn send_on_remote(
+    /// Send a binary message on a protomux channel (local or remote id).
+    pub fn send_on_channel(
         &mut self,
-        remote_id: u64,
+        channel_id: u64,
         msg_type: u64,
         payload: &[u8],
     ) -> Result<(), MuxError> {
         let mut body = BytesMut::new();
         encode_buffer(payload, &mut body);
-        let frame = encode_channel_message(remote_id, msg_type, &mut body);
+        let frame = encode_channel_message(channel_id, msg_type, &mut body);
         self.write_frame(frame)
+    }
+
+    /// Open a `hypercore/alpha` channel for replication pull/push.
+    pub fn open_hypercore_channel(
+        &mut self,
+        protocol: &str,
+        discovery_key: &[u8; 32],
+        handshake: &[u8],
+    ) -> Result<u64, MuxError> {
+        let local_id = if let Some(id) = self.free_local_ids.pop() {
+            id
+        } else {
+            let id = self.next_local_id;
+            self.next_local_id += 1;
+            while self.local.len() < id as usize {
+                self.local.push(None);
+            }
+            id
+        };
+
+        let idx = local_id as usize - 1;
+        while self.local.len() <= idx {
+            self.local.push(None);
+        }
+
+        let mut channel = Channel::new(protocol);
+        channel.local_id = local_id;
+        channel.opened = true;
+        self.local[idx] = Some(channel);
+
+        self.send_open(local_id, protocol, Some(discovery_key), handshake)?;
+        Ok(local_id)
+    }
+
+    pub fn set_local_binary_handler(
+        &mut self,
+        local_id: u64,
+        handler: BinaryMessageCallback,
+    ) {
+        self.local_binary_handlers.insert(local_id, handler);
     }
 
     pub fn set_remote_binary_handler(
@@ -297,6 +339,11 @@ impl PeerMux {
         msg_type: u64,
         payload: &[u8],
     ) -> Result<(), MuxError> {
+        if let Some(handler) = self.local_binary_handlers.get_mut(&remote_id) {
+            handler(msg_type, payload);
+            return Ok(());
+        }
+
         let rid = remote_id as usize - 1;
         let Some(slot) = self.remote.get_mut(rid).and_then(|s| s.as_mut()) else {
             return Err(MuxError::InvalidFrame);
@@ -318,11 +365,18 @@ impl PeerMux {
         Ok(())
     }
 
-    fn send_open(&mut self, local_id: u64, protocol: &str, id: Option<&[u8]>) -> Result<(), MuxError> {
+    fn send_open(
+        &mut self,
+        local_id: u64,
+        protocol: &str,
+        id: Option<&[u8]>,
+        handshake: &[u8],
+    ) -> Result<(), MuxError> {
         let mut payload = BytesMut::new();
         encode_uint(local_id, &mut payload);
         encode_string(protocol, &mut payload);
         encode_optional_buffer(id, &mut payload);
+        payload.extend_from_slice(handshake);
         let frame = encode_control_frame(1, &mut payload);
         self.write_frame(frame)
     }

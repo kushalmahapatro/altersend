@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use altersend_mux::{BinaryMessageCallback, MuxError, PeerMux};
+use hypercore::Hypercore;
 use hypercore_protocol::{Message, schema::*};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::drive::OutgoingDrive;
 use crate::replication::capability::{decode_handshake, expected_remote_capability};
 use crate::replication::wire::{decode_message, encode_body};
 
@@ -27,7 +27,7 @@ struct PeerState {
 
 pub struct HypercoreReplicationPeer {
     remote_id: u64,
-    drive: Arc<Mutex<OutgoingDrive>>,
+    core: Arc<Mutex<Hypercore>>,
     outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     peer_state: PeerState,
 }
@@ -40,7 +40,7 @@ impl HypercoreReplicationPeer {
         local_is_initiator: bool,
         handshake_hash: &[u8; 64],
         core_public_key: [u8; 32],
-        drive: Arc<Mutex<OutgoingDrive>>,
+        core: Arc<Mutex<Hypercore>>,
         outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     ) -> Result<(), String> {
         let (_, remote_capability) =
@@ -53,7 +53,7 @@ impl HypercoreReplicationPeer {
 
         let peer = Arc::new(Mutex::new(Self {
             remote_id,
-            drive,
+            core,
             outbound_tx: outbound_tx.clone(),
             peer_state: PeerState {
                 can_upgrade: true,
@@ -62,7 +62,7 @@ impl HypercoreReplicationPeer {
         }));
 
         info!(
-            "hypercore/alpha replication attached on channel {remote_id} for {}",
+            "hypercore/alpha replication server on channel {remote_id} for {}",
             hex::encode(core_public_key)
         );
 
@@ -96,8 +96,8 @@ impl HypercoreReplicationPeer {
 
     async fn send_initial_sync(&self) -> Result<(), String> {
         let (fork, length, contiguous_length) = {
-            let drive = self.drive.lock().await;
-            let info = drive.core_info();
+            let core = self.core.lock().await;
+            let info = core.info();
             (info.fork, info.length, info.contiguous_length)
         };
 
@@ -152,12 +152,12 @@ impl HypercoreReplicationPeer {
 
     async fn on_request(&mut self, message: Request) -> Result<(), String> {
         let (fork, proof) = {
-            let mut drive = self.drive.lock().await;
-            let proof = drive
+            let mut core = self.core.lock().await;
+            let proof = core
                 .create_proof(message.block, message.hash, message.seek, message.upgrade)
                 .await
                 .map_err(|e| e.to_string())?;
-            (drive.core_info().fork, proof)
+            (core.info().fork, proof)
         };
 
         if let Some(proof) = proof {
@@ -174,7 +174,6 @@ impl HypercoreReplicationPeer {
     }
 }
 
-/// Send a replication wire message on a protomux channel.
 pub trait ReplicationMux {
     fn send_message(&mut self, remote_id: u64, message: &Message) -> Result<(), MuxError>;
 }
@@ -182,7 +181,7 @@ pub trait ReplicationMux {
 impl ReplicationMux for PeerMux {
     fn send_message(&mut self, remote_id: u64, message: &Message) -> Result<(), MuxError> {
         let (msg_type, body) = encode_body(message).ok_or(MuxError::InvalidFrame)?;
-        self.send_on_remote(remote_id, msg_type, &body)
+        self.send_on_channel(remote_id, msg_type, &body)
     }
 }
 

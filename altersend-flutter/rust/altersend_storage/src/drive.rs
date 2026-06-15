@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use hypercore::{Hypercore, HypercoreBuilder, Storage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs;
+use tokio::sync::Mutex;
 
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
@@ -35,7 +37,7 @@ pub struct StagedFileMeta {
 /// `driveKey` in control messages — matching the JS worklet shape. Full Hyperdrive
 /// metadata replication for Electron/RN interop is still pending.
 pub struct OutgoingDrive {
-    core: Hypercore,
+    core: Arc<Mutex<Hypercore>>,
     files: Vec<StagedFileMeta>,
 }
 
@@ -46,13 +48,18 @@ impl OutgoingDrive {
         let storage = Storage::new_disk(&dir, true).await?;
         let core = HypercoreBuilder::new(storage).build().await?;
         Ok(Self {
-            core,
+            core: Arc::new(Mutex::new(core)),
             files: Vec::new(),
         })
     }
 
-    pub fn key_hex(&self) -> String {
-        hex::encode(self.core.key_pair().public.as_bytes())
+    pub fn shared_core(&self) -> Arc<Mutex<Hypercore>> {
+        self.core.clone()
+    }
+
+    pub async fn key_hex(&self) -> String {
+        let core = self.core.lock().await;
+        hex::encode(core.key_pair().public.as_bytes())
     }
 
     pub fn files(&self) -> &[StagedFileMeta] {
@@ -71,12 +78,14 @@ impl OutgoingDrive {
         disk_path: &Path,
     ) -> Result<(), DriveError> {
         let data = fs::read(disk_path).await?;
-        let block_start = self.core.info().length;
+        let mut core = self.core.lock().await;
+        let block_start = core.info().length;
         let block_count = data.len().div_ceil(CHUNK_SIZE) as u64;
 
         for chunk in data.chunks(CHUNK_SIZE) {
-            self.core.append(chunk).await?;
+            core.append(chunk).await?;
         }
+        drop(core);
 
         self.files.push(StagedFileMeta {
             id: file_id.to_string(),
@@ -109,12 +118,12 @@ impl OutgoingDrive {
 
         let mut written = 0usize;
         let mut pos = offset;
+        let mut core = self.core.lock().await;
 
         while written < buf.len() && pos < meta.size {
             let block_index = meta.block_start + (pos as usize / CHUNK_SIZE) as u64;
             let block_offset = (pos as usize) % CHUNK_SIZE;
-            let block = self
-                .core
+            let block = core
                 .get(block_index)
                 .await?
                 .ok_or(DriveError::NotStaged)?;
@@ -129,27 +138,27 @@ impl OutgoingDrive {
         Ok(written)
     }
 
-    pub fn core_length(&self) -> u64 {
-        self.core.info().length
+    pub async fn core_length(&self) -> u64 {
+        self.core.lock().await.info().length
     }
 
-    pub fn core_info(&self) -> hypercore::Info {
-        self.core.info()
+    pub async fn core_info(&self) -> hypercore::Info {
+        self.core.lock().await.info()
     }
 
-    pub fn public_key_bytes(&self) -> [u8; 32] {
-        self.core.key_pair().public.to_bytes()
+    pub async fn public_key_bytes(&self) -> [u8; 32] {
+        self.core.lock().await.key_pair().public.to_bytes()
     }
 
     pub async fn create_proof(
-        &mut self,
+        &self,
         block: Option<hypercore_schema::RequestBlock>,
         hash: Option<hypercore_schema::RequestBlock>,
         seek: Option<hypercore_schema::RequestSeek>,
         upgrade: Option<hypercore_schema::RequestUpgrade>,
     ) -> Result<Option<hypercore_schema::Proof>, DriveError> {
-        Ok(self
-            .core
+        let mut core = self.core.lock().await;
+        Ok(core
             .create_proof(block, hash, seek, upgrade)
             .await?)
     }
@@ -169,7 +178,7 @@ mod tests {
                 .as_nanos()
         ));
         let mut drive = OutgoingDrive::open(&dir).await.unwrap();
-        let key = drive.key_hex();
+        let key = drive.key_hex().await;
         assert_eq!(key.len(), 64);
 
         let file_path = dir.join("sample.txt");

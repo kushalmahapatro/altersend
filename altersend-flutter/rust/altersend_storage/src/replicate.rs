@@ -2,24 +2,33 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use altersend_mux::PeerMux;
-use tokio::sync::{mpsc, RwLock};
+use hypercore::Hypercore;
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::info;
 
 use crate::drive::OutgoingDrive;
-use crate::replication::{HypercoreReplicationPeer, ReplicationOutbound};
+use crate::replication::{
+    HypercoreReplicationClient, HypercoreReplicationPeer, ReplicationOutbound,
+};
 
-/// Local Hypercore registered for outgoing replication to legacy peers.
+/// Hypercore registered for replication with a connected peer.
 #[derive(Clone)]
 pub struct RegisteredCore {
     pub public_key_hex: String,
     pub discovery_key_hex: String,
+    pub upload: bool,
+}
+
+struct RegisteredCoreState {
+    meta: RegisteredCore,
+    core: Arc<Mutex<Hypercore>>,
 }
 
 /// Tracks active outgoing drive keys and registered cores for replication with connected peers.
 pub struct ReplicationRegistry {
     active_drive_keys: RwLock<HashMap<String, String>>,
-    registered_cores: RwLock<HashMap<String, RegisteredCore>>,
-    outgoing_drive: RwLock<Option<Arc<tokio::sync::Mutex<OutgoingDrive>>>>,
+    registered_cores: RwLock<HashMap<String, RegisteredCoreState>>,
+    outgoing_drive: RwLock<Option<Arc<Mutex<OutgoingDrive>>>>,
 }
 
 impl ReplicationRegistry {
@@ -31,26 +40,57 @@ impl ReplicationRegistry {
         })
     }
 
-    pub async fn set_outgoing_drive(&self, drive: Arc<tokio::sync::Mutex<OutgoingDrive>>) {
-        let key_hex = {
+    pub async fn set_outgoing_drive(&self, drive: Arc<Mutex<OutgoingDrive>>) {
+        let (key_hex, core) = {
             let guard = drive.lock().await;
-            guard.key_hex()
+            (guard.key_hex().await, guard.shared_core())
         };
-        let discovery = discovery_key_hex(&key_hex);
-        let core = RegisteredCore {
-            public_key_hex: key_hex.clone(),
-            discovery_key_hex: discovery.clone(),
-        };
-        self.registered_cores
-            .write()
-            .await
-            .insert(discovery, core);
+        self.register_core(&key_hex, core, true).await;
         *self.outgoing_drive.write().await = Some(drive);
     }
 
+    pub async fn register_incoming_core(
+        &self,
+        public_key_hex: &str,
+        core: Arc<Mutex<Hypercore>>,
+    ) {
+        self.register_core(public_key_hex, core, false).await;
+    }
+
+    async fn register_core(
+        &self,
+        public_key_hex: &str,
+        core: Arc<Mutex<Hypercore>>,
+        upload: bool,
+    ) {
+        let discovery = discovery_key_hex(public_key_hex);
+        let meta = RegisteredCore {
+            public_key_hex: public_key_hex.to_string(),
+            discovery_key_hex: discovery.clone(),
+            upload,
+        };
+        self.registered_cores.write().await.insert(
+            discovery,
+            RegisteredCoreState {
+                meta,
+                core,
+            },
+        );
+    }
+
     pub async fn clear_outgoing_drive(&self) {
-        self.registered_cores.write().await.clear();
+        self.registered_cores
+            .write()
+            .await
+            .retain(|_, state| !state.meta.upload);
         *self.outgoing_drive.write().await = None;
+    }
+
+    pub async fn clear_incoming_cores(&self) {
+        self.registered_cores
+            .write()
+            .await
+            .retain(|_, state| state.meta.upload);
     }
 
     pub async fn registered_core_for_discovery(
@@ -61,14 +101,29 @@ impl ReplicationRegistry {
             .read()
             .await
             .get(&discovery_key_hex.to_lowercase())
-            .cloned()
+            .map(|state| state.meta.clone())
+    }
+
+    pub async fn download_targets(&self) -> Vec<(RegisteredCore, Arc<Mutex<Hypercore>>)> {
+        self.registered_cores
+            .read()
+            .await
+            .values()
+            .filter(|state| !state.meta.upload)
+            .map(|state| (state.meta.clone(), state.core.clone()))
+            .collect()
     }
 
     pub async fn registered_cores(&self) -> Vec<RegisteredCore> {
-        self.registered_cores.read().await.values().cloned().collect()
+        self.registered_cores
+            .read()
+            .await
+            .values()
+            .map(|state| state.meta.clone())
+            .collect()
     }
 
-    pub async fn outgoing_drive(&self) -> Option<Arc<tokio::sync::Mutex<OutgoingDrive>>> {
+    pub async fn outgoing_drive(&self) -> Option<Arc<Mutex<OutgoingDrive>>> {
         self.outgoing_drive.read().await.clone()
     }
 
@@ -85,7 +140,8 @@ impl ReplicationRegistry {
 
     pub async fn clear_all(&self) {
         self.active_drive_keys.write().await.clear();
-        self.clear_outgoing_drive().await;
+        self.registered_cores.write().await.clear();
+        *self.outgoing_drive.write().await = None;
     }
 }
 
@@ -114,19 +170,15 @@ impl ReplicationHandle {
         handshake_hash: &[u8; 64],
         outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     ) -> Result<(), String> {
-        let core = self
-            .registry
-            .registered_core_for_discovery(discovery_key_hex)
-            .await
-            .ok_or_else(|| format!("unknown discovery key {discovery_key_hex}"))?;
+        let (meta, core) = {
+            let guard = self.registry.registered_cores.read().await;
+            let state = guard
+                .get(&discovery_key_hex.to_lowercase())
+                .ok_or_else(|| format!("unknown discovery key {discovery_key_hex}"))?;
+            (state.meta.clone(), state.core.clone())
+        };
 
-        let drive = self
-            .registry
-            .outgoing_drive()
-            .await
-            .ok_or_else(|| "no outgoing drive staged".to_string())?;
-
-        let public_key = hex::decode(&core.public_key_hex)
+        let public_key = hex::decode(&meta.public_key_hex)
             .map_err(|_| "invalid core public key".to_string())?;
         if public_key.len() != 32 {
             return Err("core public key must be 32 bytes".into());
@@ -135,20 +187,36 @@ impl ReplicationHandle {
         key.copy_from_slice(&public_key);
 
         info!(
-            "legacy peer {} opened hypercore/alpha for local core {}",
-            self.peer_key, discovery_key_hex
+            "peer {} hypercore/alpha channel {} for core {} ({})",
+            self.peer_key,
+            remote_id,
+            discovery_key_hex,
+            if meta.upload { "upload" } else { "download" }
         );
 
-        HypercoreReplicationPeer::attach(
-            mux,
-            remote_id,
-            handshake,
-            local_is_initiator,
-            handshake_hash,
-            key,
-            drive,
-            outbound_tx,
-        )
+        if meta.upload {
+            HypercoreReplicationPeer::attach(
+                mux,
+                remote_id,
+                handshake,
+                local_is_initiator,
+                handshake_hash,
+                key,
+                core,
+                outbound_tx,
+            )
+        } else {
+            HypercoreReplicationClient::attach(
+                mux,
+                remote_id,
+                handshake,
+                local_is_initiator,
+                handshake_hash,
+                key,
+                core,
+                outbound_tx,
+            )
+        }
     }
 
     pub async fn detach(self) {

@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use altersend_domain::IncomingFileOffer;
-use altersend_storage::{OutgoingDrive, ReplicationRegistry};
+use altersend_storage::{IncomingHyperdrive, OutgoingDrive, ReplicationRegistry};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -60,6 +61,8 @@ pub struct DownloadRequest {
     pub file_id: String,
     pub file_name: String,
     pub total_bytes: u64,
+    pub drive_key: Option<String>,
+    pub path: Option<String>,
 }
 
 enum OrchestratorCommand {
@@ -119,6 +122,7 @@ impl TransferOrchestrator {
         let event_tx_loop = event_tx.clone();
         let swarm_for_loop = swarm_client.clone();
         let drive_dir = storage_root.join("outgoing-drive");
+        let incoming_drives_dir = storage_root.join("incoming-drives");
         let identity_for_loop = identity_store.clone();
 
         let task = tokio::spawn(async move {
@@ -144,6 +148,7 @@ impl TransferOrchestrator {
                             &event_tx_loop,
                             &download_dir,
                             &drive_dir,
+                            &incoming_drives_dir,
                             &replication_registry,
                             &identity_for_loop,
                             cmd,
@@ -200,6 +205,7 @@ async fn handle_command(
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
     download_dir: &PathBuf,
     drive_dir: &Path,
+    incoming_drives_dir: &Path,
     replication_registry: &Arc<ReplicationRegistry>,
     identity_store: &Arc<PeerIdentityStore>,
     cmd: OrchestratorCommand,
@@ -252,8 +258,16 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         OrchestratorCommand::DownloadFiles(requests, reply) => {
-            let result =
-                download_files(state, swarm, event_tx, download_dir, requests).await;
+            let result = download_files(
+                state,
+                swarm,
+                event_tx,
+                download_dir,
+                incoming_drives_dir,
+                replication_registry,
+                requests,
+            )
+            .await;
             let _ = reply.send(result);
         }
         OrchestratorCommand::Disconnect(reply) => {
@@ -680,7 +694,7 @@ async fn share_files(
             .map_err(|e| e.to_string())?;
     }
 
-    let drive_key = drive.key_hex();
+    let drive_key = drive.key_hex().await;
     let drive = Arc::new(Mutex::new(drive));
     replication_registry.set_outgoing_drive(drive.clone()).await;
     let offers = build_file_offers(&transfer_id, &drive_key, &scan.files);
@@ -738,26 +752,38 @@ async fn download_files(
     swarm: &SwarmHandleClient,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
     download_dir: &PathBuf,
+    incoming_drives_dir: &Path,
+    replication_registry: &Arc<ReplicationRegistry>,
     requests: Vec<DownloadRequest>,
 ) -> Result<(), String> {
-    let (transfer_id, has_legacy_peer) = {
+    let (transfer_id, legacy_peers) = {
         let guard = state.lock().await;
         let transfer_id = guard
             .transfer_id
             .clone()
             .unwrap_or_else(create_transfer_id);
-        let has_legacy_peer = guard
+        let legacy_peers: Vec<String> = guard
             .peer_modes
-            .values()
-            .any(|mode| mode.uses_hypercore_replication());
-        (transfer_id, has_legacy_peer)
+            .iter()
+            .filter(|(_, mode)| mode.uses_hypercore_replication())
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        (transfer_id, legacy_peers)
     };
 
-    if has_legacy_peer {
-        return Err(
-            "Downloading from legacy AlterSend peers requires Hyperdrive replication (in progress)."
-                .into(),
-        );
+    if !legacy_peers.is_empty() {
+        return download_from_legacy_peers(
+            state,
+            swarm,
+            event_tx,
+            download_dir,
+            incoming_drives_dir,
+            replication_registry,
+            &transfer_id,
+            &legacy_peers,
+            requests,
+        )
+        .await;
     }
 
     for req in requests {
@@ -797,6 +823,145 @@ async fn download_files(
             .await;
     }
 
+    Ok(())
+}
+
+async fn download_from_legacy_peers(
+    state: &Arc<Mutex<OrchestratorState>>,
+    swarm: &SwarmHandleClient,
+    event_tx: &mpsc::UnboundedSender<EngineEvent>,
+    download_dir: &PathBuf,
+    incoming_drives_dir: &Path,
+    replication_registry: &Arc<ReplicationRegistry>,
+    transfer_id: &str,
+    legacy_peers: &[String],
+    requests: Vec<DownloadRequest>,
+) -> Result<(), String> {
+    const REPL_WAIT: Duration = Duration::from_secs(120);
+
+    for req in requests {
+        if !is_safe_file_name(&req.file_name) {
+            return Err(format!("Unsafe file name: {}", req.file_name));
+        }
+
+        let offer = {
+            let guard = state.lock().await;
+            guard
+                .file_offers
+                .iter()
+                .find(|f| f.id == req.file_id)
+                .cloned()
+        };
+
+        let drive_key = req
+            .drive_key
+            .clone()
+            .or_else(|| offer.as_ref().map(|o| o.drive_key.clone()))
+            .ok_or_else(|| format!("missing drive key for {}", req.file_name))?;
+        let path = req
+            .path
+            .clone()
+            .or_else(|| offer.as_ref().map(|o| o.path.clone()))
+            .unwrap_or_else(|| format!("/{}", req.file_name));
+
+        emit_download(
+            event_tx,
+            "downloading",
+            &req.file_id,
+            &req.file_name,
+            0,
+            req.total_bytes,
+            None,
+            None,
+        )
+        .await;
+
+        let session_dir = incoming_drives_dir.join(&drive_key);
+        let mut incoming =
+            IncomingHyperdrive::open(&session_dir, &drive_key)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        replication_registry
+            .register_incoming_core(&drive_key, incoming.metadata_core())
+            .await;
+
+        for peer in legacy_peers {
+            swarm.open_incoming_replication(peer).await;
+        }
+
+        let metadata = incoming.metadata_core();
+        incoming
+            .wait_until_contiguous(&metadata, 2, REPL_WAIT)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let blobs = incoming
+            .blobs_core(&session_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+        let blobs_key = {
+            let core = blobs.lock().await;
+            hex::encode(core.key_pair().public.as_bytes())
+        };
+        replication_registry
+            .register_incoming_core(&blobs_key, blobs.clone())
+            .await;
+
+        for peer in legacy_peers {
+            swarm.open_incoming_replication(peer).await;
+        }
+
+        let data = incoming
+            .read_file(&path, REPL_WAIT)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if req.total_bytes > 0 && data.len() as u64 != req.total_bytes {
+            return Err(format!(
+                "size mismatch for {}: expected {} got {}",
+                req.file_name,
+                req.total_bytes,
+                data.len()
+            ));
+        }
+
+        let dest = download_dir.join(&req.file_name);
+        tokio::fs::write(&dest, &data)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        emit_download(
+            event_tx,
+            "downloaded",
+            &req.file_id,
+            &req.file_name,
+            data.len() as u64,
+            req.total_bytes,
+            Some(dest.display().to_string()),
+            None,
+        )
+        .await;
+
+        let ctrl = PeerControlMessage::DownloadRequest {
+            transfer_id: transfer_id.to_string(),
+            file_id: req.file_id.clone(),
+            file_name: req.file_name.clone(),
+            path: path.clone(),
+            total_bytes: req.total_bytes,
+        };
+        swarm.broadcast_bytes(encode_control_frame(&ctrl)).await;
+
+        let complete = PeerControlMessage::DownloadComplete {
+            transfer_id: transfer_id.to_string(),
+            file_id: req.file_id.clone(),
+            file_name: req.file_name.clone(),
+            saved_to: dest.display().to_string(),
+        };
+        swarm.broadcast_bytes(encode_control_frame(&complete)).await;
+    }
+
+    replication_registry.clear_incoming_cores().await;
     Ok(())
 }
 

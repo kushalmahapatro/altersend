@@ -125,6 +125,8 @@ impl AlterSendEngine {
                 file_id: f.id.clone(),
                 file_name: f.name.clone(),
                 total_bytes: f.size,
+                drive_key: Some(f.drive_key.clone()),
+                path: Some(f.path.clone()),
             })
             .collect();
         let orch = self.orchestrator.lock().await;

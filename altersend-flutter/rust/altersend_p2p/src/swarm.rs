@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use altersend_mux::HYPERCORE_ALPHA_PROTOCOL;
 use altersend_storage::{
-    send_replication_outbound, ReplicationHandle, ReplicationRegistry, ReplicationOutbound,
+    encode_handshake, local_capability, send_replication_outbound, HypercoreReplicationClient,
+    ReplicationHandle, ReplicationRegistry, ReplicationOutbound,
 };
 use bytes::Bytes;
 use peeroxide::{discovery_key, spawn, JoinOpts, KeyPair, SwarmConfig, SwarmConnection, SwarmHandle};
@@ -42,6 +44,7 @@ enum PeerCommand {
         offset: u64,
         data: Vec<u8>,
     },
+    OpenIncomingReplication,
 }
 
 /// Handle to the background Hyperswarm actor (non-blocking).
@@ -63,6 +66,7 @@ enum SwarmCommand {
         data: Vec<u8>,
     },
     PeerCount(oneshot::Sender<usize>),
+    OpenIncomingReplication { peer: PeerKey },
     EndSession(oneshot::Sender<()>),
     Destroy(oneshot::Sender<()>),
 }
@@ -168,6 +172,12 @@ impl SwarmHandleClient {
         }
     }
 
+    pub async fn open_incoming_replication(&self, peer: &str) {
+        let _ = self.cmd_tx.send(SwarmCommand::OpenIncomingReplication {
+            peer: peer.to_string(),
+        });
+    }
+
     pub async fn peer_count(&self) -> usize {
         let (tx, rx) = oneshot::channel();
         if self.cmd_tx.send(SwarmCommand::PeerCount(tx)).is_err() {
@@ -258,6 +268,12 @@ async fn swarm_actor(
                         let guard = sessions.read().await;
                         if let Some(p) = guard.get(&peer) {
                             let _ = p.cmd_tx.send(PeerCommand::SendChunk { file_id, offset, data });
+                        }
+                    }
+                    SwarmCommand::OpenIncomingReplication { peer } => {
+                        let guard = sessions.read().await;
+                        if let Some(p) = guard.get(&peer) {
+                            let _ = p.cmd_tx.send(PeerCommand::OpenIncomingReplication);
                         }
                     }
                     SwarmCommand::PeerCount(reply) => {
@@ -371,7 +387,7 @@ async fn swarm_actor(
 
                     let mut read_buffer = Vec::new();
                     let replication_handle =
-                        ReplicationHandle::attach_peer(&peer_for_task, replication_registry_for_open);
+                        ReplicationHandle::attach_peer(&peer_for_task, replication_registry_for_open.clone());
                     loop {
                         tokio::select! {
                             hc_open = hc_open_rx.recv() => {
@@ -413,6 +429,16 @@ async fn swarm_actor(
                                                 PeerInteropMode::Rust,
                                             ));
                                         }
+                                    }
+                                    Some(PeerCommand::OpenIncomingReplication) => {
+                                        open_incoming_replication_channels(
+                                            &mut session.mux,
+                                            &replication_registry_for_open,
+                                            is_initiator,
+                                            &handshake_hash,
+                                            repl_out_tx.clone(),
+                                        )
+                                        .await;
                                     }
                                     None => break,
                                 }
@@ -464,6 +490,55 @@ fn decode_chunk_json(value: &serde_json::Value) -> Option<WireFrame> {
     let bytes = hex::decode(hex_payload).ok()?;
     let mut buf = bytes;
     crate::wire::drain_frames(&mut buf).into_iter().next()
+}
+
+async fn open_incoming_replication_channels(
+    mux: &mut altersend_mux::PeerMux,
+    registry: &ReplicationRegistry,
+    is_initiator: bool,
+    handshake_hash: &[u8; 64],
+    repl_out_tx: mpsc::UnboundedSender<ReplicationOutbound>,
+) {
+    let targets = registry.download_targets().await;
+    for (meta, core) in targets {
+        let Ok(pk) = hex::decode(&meta.public_key_hex) else {
+            continue;
+        };
+        if pk.len() != 32 {
+            continue;
+        }
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(&pk);
+        let Ok(dk) = hex::decode(&meta.discovery_key_hex) else {
+            continue;
+        };
+        if dk.len() != 32 {
+            continue;
+        }
+        let mut discovery = [0u8; 32];
+        discovery.copy_from_slice(&dk);
+        let capability = local_capability(is_initiator, &public_key, handshake_hash);
+        let handshake = encode_handshake(true, &capability);
+        let local_id = match mux.open_hypercore_channel(HYPERCORE_ALPHA_PROTOCOL, &discovery, &handshake)
+        {
+            Ok(id) => id,
+            Err(err) => {
+                warn!("open hypercore channel for {}: {err}", meta.discovery_key_hex);
+                continue;
+            }
+        };
+        if let Err(err) = HypercoreReplicationClient::attach_outbound(
+            mux,
+            local_id,
+            is_initiator,
+            handshake_hash,
+            public_key,
+            core,
+            repl_out_tx.clone(),
+        ) {
+            warn!("attach outbound replication: {err}");
+        }
+    }
 }
 
 async fn join_raw_topic(
