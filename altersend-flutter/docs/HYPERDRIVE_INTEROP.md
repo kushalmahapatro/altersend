@@ -34,8 +34,8 @@ Flutter+Rust now **detects** when a connected peer opens `hypercore/alpha` and m
 | Per-topic Noise identity (join) | `identity/topic-keys.json` — JS-compatible ✅ |
 | Legacy peer detection | Opens `hypercore/alpha` → `PeerInteropMode::Legacy` ✅ |
 | Outgoing core registration | Hypercore staged + registered for replication hooks ✅ |
-| Legacy file byte transfer (sender) | Hypercore replication wire handler serves staged blocks ✅ |
-| Legacy file byte transfer (receiver) | Hyperdrive pull path: replicate metadata+blobs, read via hyperbee scan ✅ (needs outgoing Hyperdrive sender) |
+| Legacy file byte transfer (sender) | Real Hyperdrive metadata+blobs staging + hypercore/alpha replication ✅ |
+| Legacy file byte transfer (receiver) | Hyperdrive pull path: replicate metadata+blobs, read via hyperbee scan ✅ |
 
 ## Implemented setup (this branch)
 
@@ -46,11 +46,11 @@ Flutter+Rust now **detects** when a connected peer opens `hypercore/alpha` and m
 5. **Receiver path** — when a legacy sender is detected, opens `IncomingHyperdrive` by `driveKey`, registers metadata+blobs cores for download replication, proactively opens `hypercore/alpha` channels, and reads the file via hyperbee scan + blob blocks.
 6. **`HypercoreReplicationClient`** — download-side replication (sync/request/data apply) for incoming cores.
 7. **`IncomingHyperdrive`** — minimal hyperbee reader: path lookup, header content-key → blobs core, `read_file()`.
+8. **`OutgoingDrive`** — stages files into Hyperdrive metadata+blobs cores with hyperbee node encoding and registers both cores for legacy replication.
 
 ## Remaining work for full legacy interop
 
-1. **Outgoing Hyperdrive port** — stage files into real Hyperdrive metadata/content cores (not bare Hypercore blocks) so legacy receivers can pull by `driveKey`.
-2. **End-to-end manual interop** — Flutter sender → legacy receiver and legacy sender → Flutter receiver on real devices.
+1. **End-to-end manual interop** — Flutter sender → legacy receiver and legacy sender → Flutter receiver on real devices.
 
 ## Crates
 
@@ -63,5 +63,5 @@ altersend_p2p/      — identity store, peer mode, swarm/orchestrator wiring
 ## Manual interop test
 
 1. Legacy sender → Flutter receiver (receiver pull path implemented; verify on device)
-2. Flutter sender → legacy receiver (blocked until outgoing Hyperdrive port)
+2. Flutter sender → legacy receiver (outgoing Hyperdrive staging implemented; verify on device)
 3. Late-join peer receives replayed `transfer-start` / `transfer-ready`

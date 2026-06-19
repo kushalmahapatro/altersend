@@ -1,4 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+pub const BLOB_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Hyperdrive path key encoding: `files\0` + utf-8 path.
 pub fn encode_drive_path(path: &str) -> Vec<u8> {
@@ -9,7 +11,7 @@ pub fn encode_drive_path(path: &str) -> Vec<u8> {
     key
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriveEntryValue {
     pub executable: Option<bool>,
     pub linkname: Option<String>,
@@ -17,7 +19,7 @@ pub struct DriveEntryValue {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobRef {
     #[serde(rename = "blockOffset")]
     pub block_offset: u64,
@@ -156,6 +158,86 @@ fn skip_field(wire: u64, buf: &[u8]) -> Option<usize> {
     }
 }
 
+/// Hyperbee block 0: protocol + optional content feed for the blobs core.
+pub fn encode_hyperbee_header(content_feed: &[u8; 32]) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    write_bytes_field(1, content_feed, &mut metadata);
+
+    let mut out = Vec::new();
+    write_string_field(1, "hyperbee", &mut out);
+    write_key_varint(2, 2, &mut out);
+    write_varint(metadata.len() as u64, &mut out);
+    out.extend_from_slice(&metadata);
+    out
+}
+
+/// Encode a hyperbee node block for a drive path entry.
+pub fn encode_hyperbee_node(sorted_seqs: &[u64], key: &[u8], value: &[u8]) -> Vec<u8> {
+    let index = encode_yolo_index(sorted_seqs);
+    let mut out = Vec::new();
+    write_bytes_field(1, &index, &mut out);
+    write_bytes_field(2, key, &mut out);
+    write_bytes_field(3, value, &mut out);
+    out
+}
+
+pub fn encode_entry_value(blob: &BlobRef) -> Vec<u8> {
+    serde_json::to_vec(&DriveEntryValue {
+        executable: Some(false),
+        linkname: None,
+        blob: Some(blob.clone()),
+        metadata: None,
+    })
+    .expect("entry value json")
+}
+
+fn encode_yolo_index(sorted_seqs: &[u64]) -> Vec<u8> {
+    let mut packed = Vec::new();
+    for seq in sorted_seqs {
+        write_varint(*seq, &mut packed);
+    }
+    let mut level = Vec::new();
+    write_key_varint(1, 2, &mut level);
+    write_varint(packed.len() as u64, &mut level);
+    level.extend_from_slice(&packed);
+
+    let mut out = Vec::new();
+    write_key_varint(1, 2, &mut out);
+    write_varint(level.len() as u64, &mut out);
+    out.extend_from_slice(&level);
+    out
+}
+
+fn write_varint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn write_key_varint(field_number: u64, wire_type: u64, out: &mut Vec<u8>) {
+    write_varint((field_number << 3) | wire_type, out);
+}
+
+fn write_string_field(field: u64, value: &str, out: &mut Vec<u8>) {
+    write_key_varint(field, 2, out);
+    write_varint(value.len() as u64, out);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn write_bytes_field(field: u64, data: &[u8], out: &mut Vec<u8>) {
+    write_key_varint(field, 2, out);
+    write_varint(data.len() as u64, out);
+    out.extend_from_slice(data);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +248,23 @@ mod tests {
         assert_eq!(&key[..5], b"files");
         assert_eq!(key[5], 0);
         assert_eq!(&key[6..], b"/sample.txt");
+    }
+
+    #[test]
+    fn encodes_first_hyperbee_node_like_js() {
+        let blob = BlobRef {
+            block_offset: 0,
+            block_length: 1,
+            byte_offset: 0,
+            byte_length: 24,
+        };
+        let node = encode_hyperbee_node(
+            &[1],
+            &encode_drive_path("/sample.txt"),
+            &encode_entry_value(&blob),
+        );
+        assert_eq!(&node[..5], &[0x0a, 0x05, 0x0a, 0x03, 0x0a]);
+        let value = find_entry_value(&[vec![], node], "/sample.txt").expect("entry");
+        assert_eq!(value.blob.as_ref().map(|b| b.byte_length), Some(24));
     }
 }

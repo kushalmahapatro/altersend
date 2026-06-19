@@ -1,8 +1,7 @@
-//! Corestore / Hyperdrive storage scaffolding for JS interop.
+//! Corestore / Hyperdrive storage for JS interop.
 //!
-//! Full Hyperdrive replication requires a Rust Hyperdrive port (not yet available).
-//! This crate wires [`hypercore`] staging for outgoing transfers and tracks replication
-//! hooks on peer connections.
+//! Outgoing transfers stage files into real Hyperdrive metadata + blobs cores.
+//! Incoming replication reads remote drives via [`IncomingHyperdrive`].
 
 mod corestore;
 mod drive;

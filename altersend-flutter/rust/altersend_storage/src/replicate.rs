@@ -41,11 +41,17 @@ impl ReplicationRegistry {
     }
 
     pub async fn set_outgoing_drive(&self, drive: Arc<Mutex<OutgoingDrive>>) {
-        let (key_hex, core) = {
+        let (metadata_key, metadata, blobs_key, blobs) = {
             let guard = drive.lock().await;
-            (guard.key_hex().await, guard.shared_core())
+            (
+                guard.key_hex().await,
+                guard.metadata_core(),
+                guard.blobs_key_hex().await,
+                guard.blobs_core(),
+            )
         };
-        self.register_core(&key_hex, core, true).await;
+        self.register_core(&metadata_key, metadata, true).await;
+        self.register_core(&blobs_key, blobs, true).await;
         *self.outgoing_drive.write().await = Some(drive);
     }
 

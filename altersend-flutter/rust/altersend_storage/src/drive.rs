@@ -7,6 +7,11 @@ use thiserror::Error;
 use tokio::fs;
 use tokio::sync::Mutex;
 
+use crate::hyperdrive::{
+    encode_drive_path, encode_entry_value, encode_hyperbee_header, encode_hyperbee_node, BlobRef,
+    BLOB_BLOCK_SIZE,
+};
+
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
@@ -31,34 +36,71 @@ pub struct StagedFileMeta {
     pub block_count: u64,
 }
 
-/// Writable Hypercore used as the outgoing "drive" for a transfer session.
+struct StagedEntry {
+    seq: u64,
+    path: String,
+    blob: BlobRef,
+}
+
+/// Writable Hyperdrive for an outgoing transfer session.
 ///
-/// Files are staged as fixed-size Hypercore blocks. The public key hex is used as
-/// `driveKey` in control messages — matching the JS worklet shape. Full Hyperdrive
-/// metadata replication for Electron/RN interop is still pending.
+/// Files are staged into a metadata hyperbee core plus a separate blobs core.
+/// The metadata public key hex is the `driveKey` in control messages.
 pub struct OutgoingDrive {
-    core: Arc<Mutex<Hypercore>>,
+    metadata: Arc<Mutex<Hypercore>>,
+    blobs: Arc<Mutex<Hypercore>>,
     files: Vec<StagedFileMeta>,
+    entries: Vec<StagedEntry>,
+    total_blob_bytes: u64,
+    next_seq: u64,
 }
 
 impl OutgoingDrive {
     pub async fn open(dir: impl AsRef<Path>) -> Result<Self, DriveError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).await?;
-        let storage = Storage::new_disk(&dir, true).await?;
-        let core = HypercoreBuilder::new(storage).build().await?;
+
+        let blobs_dir = dir.join("blobs");
+        let blobs_storage = Storage::new_disk(&blobs_dir, true).await?;
+        let blobs = HypercoreBuilder::new(blobs_storage).build().await?;
+        let blobs_key = blobs.key_pair().public.to_bytes();
+
+        let db_dir = dir.join("db");
+        let metadata_storage = Storage::new_disk(&db_dir, true).await?;
+        let mut metadata = HypercoreBuilder::new(metadata_storage).build().await?;
+        metadata
+            .append(&encode_hyperbee_header(&blobs_key))
+            .await?;
+
         Ok(Self {
-            core: Arc::new(Mutex::new(core)),
+            metadata: Arc::new(Mutex::new(metadata)),
+            blobs: Arc::new(Mutex::new(blobs)),
             files: Vec::new(),
+            entries: Vec::new(),
+            total_blob_bytes: 0,
+            next_seq: 0,
         })
     }
 
+    pub fn metadata_core(&self) -> Arc<Mutex<Hypercore>> {
+        self.metadata.clone()
+    }
+
+    pub fn blobs_core(&self) -> Arc<Mutex<Hypercore>> {
+        self.blobs.clone()
+    }
+
     pub fn shared_core(&self) -> Arc<Mutex<Hypercore>> {
-        self.core.clone()
+        self.metadata_core()
     }
 
     pub async fn key_hex(&self) -> String {
-        let core = self.core.lock().await;
+        let core = self.metadata.lock().await;
+        hex::encode(core.key_pair().public.as_bytes())
+    }
+
+    pub async fn blobs_key_hex(&self) -> String {
+        let core = self.blobs.lock().await;
         hex::encode(core.key_pair().public.as_bytes())
     }
 
@@ -78,25 +120,57 @@ impl OutgoingDrive {
         disk_path: &Path,
     ) -> Result<(), DriveError> {
         let data = fs::read(disk_path).await?;
-        let mut core = self.core.lock().await;
-        let block_start = core.info().length;
-        let block_count = data.len().div_ceil(CHUNK_SIZE) as u64;
+        let blob = self.append_blob(&data).await?;
+        self.next_seq += 1;
+        let seq = self.next_seq;
 
-        for chunk in data.chunks(CHUNK_SIZE) {
-            core.append(chunk).await?;
-        }
-        drop(core);
+        self.entries.push(StagedEntry {
+            seq,
+            path: path.to_string(),
+            blob: blob.clone(),
+        });
+
+        let mut sorted = self.entries.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|entry| encode_drive_path(&entry.path));
+        let sorted_seqs = sorted.iter().map(|entry| entry.seq).collect::<Vec<_>>();
+
+        let node = encode_hyperbee_node(
+            &sorted_seqs,
+            &encode_drive_path(path),
+            &encode_entry_value(&blob),
+        );
+        self.metadata.lock().await.append(&node).await?;
 
         self.files.push(StagedFileMeta {
             id: file_id.to_string(),
             name: name.to_string(),
             path: path.to_string(),
             size: data.len() as u64,
-            block_start,
-            block_count,
+            block_start: blob.block_offset,
+            block_count: blob.block_length,
         });
 
         Ok(())
+    }
+
+    async fn append_blob(&mut self, data: &[u8]) -> Result<BlobRef, DriveError> {
+        let mut blobs = self.blobs.lock().await;
+        let block_offset = blobs.info().length;
+        let byte_offset = self.total_blob_bytes;
+
+        for chunk in data.chunks(BLOB_BLOCK_SIZE) {
+            blobs.append(chunk).await?;
+        }
+
+        let block_length = blobs.info().length - block_offset;
+        self.total_blob_bytes += data.len() as u64;
+
+        Ok(BlobRef {
+            block_offset,
+            block_length,
+            byte_offset,
+            byte_length: data.len() as u64,
+        })
     }
 
     pub async fn read_file_range(
@@ -116,38 +190,26 @@ impl OutgoingDrive {
             return Ok(0);
         }
 
-        let mut written = 0usize;
-        let mut pos = offset;
-        let mut core = self.core.lock().await;
+        let blob = self
+            .entries
+            .iter()
+            .find(|entry| entry.path == meta.path)
+            .map(|entry| entry.blob.clone())
+            .ok_or(DriveError::NotStaged)?;
 
-        while written < buf.len() && pos < meta.size {
-            let block_index = meta.block_start + (pos as usize / CHUNK_SIZE) as u64;
-            let block_offset = (pos as usize) % CHUNK_SIZE;
-            let block = core
-                .get(block_index)
-                .await?
-                .ok_or(DriveError::NotStaged)?;
-            let available = block.len().saturating_sub(block_offset);
-            let want = (meta.size - pos) as usize;
-            let take = available.min(want).min(buf.len() - written);
-            buf[written..written + take].copy_from_slice(&block[block_offset..block_offset + take]);
-            written += take;
-            pos += take as u64;
-        }
-
-        Ok(written)
+        read_blob_range(&self.blobs, &blob, offset, buf).await
     }
 
     pub async fn core_length(&self) -> u64 {
-        self.core.lock().await.info().length
+        self.metadata.lock().await.info().length
     }
 
     pub async fn core_info(&self) -> hypercore::Info {
-        self.core.lock().await.info()
+        self.metadata.lock().await.info()
     }
 
     pub async fn public_key_bytes(&self) -> [u8; 32] {
-        self.core.lock().await.key_pair().public.to_bytes()
+        self.metadata.lock().await.key_pair().public.to_bytes()
     }
 
     pub async fn create_proof(
@@ -157,16 +219,47 @@ impl OutgoingDrive {
         seek: Option<hypercore_schema::RequestSeek>,
         upgrade: Option<hypercore_schema::RequestUpgrade>,
     ) -> Result<Option<hypercore_schema::Proof>, DriveError> {
-        let mut core = self.core.lock().await;
+        let mut core = self.metadata.lock().await;
         Ok(core
             .create_proof(block, hash, seek, upgrade)
             .await?)
     }
 }
 
+async fn read_blob_range(
+    blobs: &Arc<Mutex<Hypercore>>,
+    blob: &BlobRef,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<usize, DriveError> {
+    if offset >= blob.byte_length {
+        return Ok(0);
+    }
+
+    let mut out = Vec::with_capacity(blob.byte_length as usize);
+    let mut core = blobs.lock().await;
+    for index in blob.block_offset..blob.block_offset + blob.block_length {
+        let block = core
+            .get(index)
+            .await?
+            .ok_or(DriveError::NotStaged)?;
+        out.extend_from_slice(&block);
+    }
+
+    let start = blob.byte_offset as usize + offset as usize;
+    let want = (blob.byte_length - offset) as usize;
+    let take = want.min(buf.len()).min(out.len().saturating_sub(start));
+    if take == 0 {
+        return Ok(0);
+    }
+    buf[..take].copy_from_slice(&out[start..start + take]);
+    Ok(take)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hyperdrive::find_entry_value;
 
     #[tokio::test]
     async fn stages_and_reads_back() {
@@ -182,7 +275,7 @@ mod tests {
         assert_eq!(key.len(), 64);
 
         let file_path = dir.join("sample.txt");
-        fs::write(&file_path, b"hello hypercore staging").await.unwrap();
+        fs::write(&file_path, b"hello hyperdrive staging").await.unwrap();
         drive
             .stage_file("f1", "sample.txt", "/sample.txt", &file_path)
             .await
@@ -190,6 +283,18 @@ mod tests {
 
         let mut buf = [0u8; 64];
         let n = drive.read_file_range("f1", 0, &mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"hello hypercore staging");
+        assert_eq!(&buf[..n], b"hello hyperdrive staging");
+
+        let blocks = {
+            let mut core = drive.metadata.lock().await;
+            let len = core.info().length;
+            let mut blocks = Vec::with_capacity(len as usize);
+            for i in 0..len {
+                blocks.push(core.get(i).await.unwrap().unwrap());
+            }
+            blocks
+        };
+        let entry = find_entry_value(&blocks, "/sample.txt").expect("metadata entry");
+        assert_eq!(entry.blob.as_ref().map(|b| b.byte_length), Some(24));
     }
 }
