@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use super::bee::{find_entry_value, parse_header_content_key, BlobRef};
+use super::manifest::{derive_blobs_public_key, ManifestSlot};
 
 #[derive(Debug, Error)]
 pub enum IncomingHyperdriveError {
@@ -26,7 +27,9 @@ pub enum IncomingHyperdriveError {
 }
 
 pub struct IncomingHyperdrive {
+    drive_key: [u8; 32],
     metadata: Arc<Mutex<Hypercore>>,
+    manifest_slot: ManifestSlot,
     blobs: Option<Arc<Mutex<Hypercore>>>,
 }
 
@@ -46,7 +49,9 @@ impl IncomingHyperdrive {
             .build()
             .await?;
         Ok(Self {
+            drive_key: public_key,
             metadata: Arc::new(Mutex::new(metadata)),
+            manifest_slot: Arc::new(Mutex::new(None)),
             blobs: None,
         })
     }
@@ -55,11 +60,19 @@ impl IncomingHyperdrive {
         self.metadata.clone()
     }
 
+    pub fn manifest_slot(&self) -> ManifestSlot {
+        self.manifest_slot.clone()
+    }
+
     pub async fn metadata_public_key_async(&self) -> [u8; 32] {
         self.metadata.lock().await.key_pair().public.to_bytes()
     }
 
-    pub async fn blobs_core(&mut self, dir: impl AsRef<Path>) -> Result<Arc<Mutex<Hypercore>>, IncomingHyperdriveError> {
+    pub async fn blobs_core(
+        &mut self,
+        dir: impl AsRef<Path>,
+        wait: Duration,
+    ) -> Result<Arc<Mutex<Hypercore>>, IncomingHyperdriveError> {
         if let Some(core) = &self.blobs {
             return Ok(core.clone());
         }
@@ -68,7 +81,11 @@ impl IncomingHyperdrive {
             core.get(0).await?
         };
         let header = header.ok_or(IncomingHyperdriveError::BlobNotAvailable)?;
-        let content_key = parse_header_content_key(&header).ok_or(IncomingHyperdriveError::BlobNotAvailable)?;
+        let content_key = if let Some(key) = parse_header_content_key(&header) {
+            key
+        } else {
+            self.wait_for_manifest(wait).await?
+        };
         let verifying = VerifyingKey::from_bytes(&content_key).map_err(|_| IncomingHyperdriveError::InvalidDriveKey)?;
         let blobs_dir = dir.as_ref().join("blobs");
         let storage = Storage::new_disk(&blobs_dir, true).await?;
@@ -82,6 +99,19 @@ impl IncomingHyperdrive {
         let arc = Arc::new(Mutex::new(blobs));
         self.blobs = Some(arc.clone());
         Ok(arc)
+    }
+
+    async fn wait_for_manifest(&self, wait: Duration) -> Result<[u8; 32], IncomingHyperdriveError> {
+        timeout(wait, async {
+            loop {
+                if let Some(manifest) = self.manifest_slot.lock().await.clone() {
+                    return Ok(derive_blobs_public_key(&manifest, &self.drive_key));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| IncomingHyperdriveError::ReplicationTimeout)?
     }
 
     pub async fn wait_until_contiguous(

@@ -883,7 +883,11 @@ async fn download_from_legacy_peers(
                 .map_err(|e| e.to_string())?;
 
         replication_registry
-            .register_incoming_core(&drive_key, incoming.metadata_core())
+            .register_incoming_core(
+                &drive_key,
+                incoming.metadata_core(),
+                Some(incoming.manifest_slot()),
+            )
             .await;
 
         for peer in legacy_peers {
@@ -897,7 +901,7 @@ async fn download_from_legacy_peers(
             .map_err(|e| e.to_string())?;
 
         let blobs = incoming
-            .blobs_core(&session_dir)
+            .blobs_core(&session_dir, REPL_WAIT)
             .await
             .map_err(|e| e.to_string())?;
         let blobs_key = {
@@ -905,7 +909,7 @@ async fn download_from_legacy_peers(
             hex::encode(core.key_pair().public.as_bytes())
         };
         replication_registry
-            .register_incoming_core(&blobs_key, blobs.clone())
+            .register_incoming_core(&blobs_key, blobs.clone(), None)
             .await;
 
         for peer in legacy_peers {

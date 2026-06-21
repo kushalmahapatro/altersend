@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::info;
 
 use crate::drive::OutgoingDrive;
+use crate::hyperdrive::ManifestSlot;
 use crate::replication::{
     HypercoreReplicationClient, HypercoreReplicationPeer, ReplicationOutbound,
 };
@@ -22,6 +23,7 @@ pub struct RegisteredCore {
 struct RegisteredCoreState {
     meta: RegisteredCore,
     core: Arc<Mutex<Hypercore>>,
+    manifest_slot: Option<ManifestSlot>,
 }
 
 /// Tracks active outgoing drive keys and registered cores for replication with connected peers.
@@ -50,8 +52,8 @@ impl ReplicationRegistry {
                 guard.blobs_core(),
             )
         };
-        self.register_core(&metadata_key, metadata, true).await;
-        self.register_core(&blobs_key, blobs, true).await;
+        self.register_core(&metadata_key, metadata, true, None).await;
+        self.register_core(&blobs_key, blobs, true, None).await;
         *self.outgoing_drive.write().await = Some(drive);
     }
 
@@ -59,8 +61,10 @@ impl ReplicationRegistry {
         &self,
         public_key_hex: &str,
         core: Arc<Mutex<Hypercore>>,
+        manifest_slot: Option<ManifestSlot>,
     ) {
-        self.register_core(public_key_hex, core, false).await;
+        self.register_core(public_key_hex, core, false, manifest_slot)
+            .await;
     }
 
     async fn register_core(
@@ -68,6 +72,7 @@ impl ReplicationRegistry {
         public_key_hex: &str,
         core: Arc<Mutex<Hypercore>>,
         upload: bool,
+        manifest_slot: Option<ManifestSlot>,
     ) {
         let discovery = discovery_key_hex(public_key_hex);
         let meta = RegisteredCore {
@@ -80,6 +85,7 @@ impl ReplicationRegistry {
             RegisteredCoreState {
                 meta,
                 core,
+                manifest_slot,
             },
         );
     }
@@ -176,12 +182,16 @@ impl ReplicationHandle {
         handshake_hash: &[u8; 64],
         outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     ) -> Result<(), String> {
-        let (meta, core) = {
+        let (meta, core, manifest_slot) = {
             let guard = self.registry.registered_cores.read().await;
             let state = guard
                 .get(&discovery_key_hex.to_lowercase())
                 .ok_or_else(|| format!("unknown discovery key {discovery_key_hex}"))?;
-            (state.meta.clone(), state.core.clone())
+            (
+                state.meta.clone(),
+                state.core.clone(),
+                state.manifest_slot.clone(),
+            )
         };
 
         let public_key = hex::decode(&meta.public_key_hex)
@@ -220,6 +230,7 @@ impl ReplicationHandle {
                 handshake_hash,
                 key,
                 core,
+                manifest_slot,
                 outbound_tx,
             )
         }

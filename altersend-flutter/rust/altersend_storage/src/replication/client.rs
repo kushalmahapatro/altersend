@@ -7,8 +7,9 @@ use hypercore_schema::RequestBlock;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
+use crate::hyperdrive::{HypercoreManifest, ManifestSlot};
 use crate::replication::capability::{decode_handshake, expected_remote_capability};
-use crate::replication::wire::decode_message;
+use crate::replication::wire::{decode_data_message, decode_message};
 
 use super::peer::ReplicationOutbound;
 
@@ -24,6 +25,7 @@ struct ClientPeerState {
 pub struct HypercoreReplicationClient {
     channel_id: u64,
     core: Arc<Mutex<Hypercore>>,
+    manifest_slot: Option<ManifestSlot>,
     outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     peer_state: ClientPeerState,
     next_request_id: u64,
@@ -38,6 +40,7 @@ impl HypercoreReplicationClient {
         handshake_hash: &[u8; 64],
         core_public_key: [u8; 32],
         core: Arc<Mutex<Hypercore>>,
+        manifest_slot: Option<ManifestSlot>,
         outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     ) -> Result<(), String> {
         Self::attach_inner(
@@ -49,6 +52,7 @@ impl HypercoreReplicationClient {
             handshake_hash,
             core_public_key,
             core,
+            manifest_slot,
             outbound_tx,
         )
     }
@@ -60,6 +64,7 @@ impl HypercoreReplicationClient {
         handshake_hash: &[u8; 64],
         core_public_key: [u8; 32],
         core: Arc<Mutex<Hypercore>>,
+        manifest_slot: Option<ManifestSlot>,
         outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     ) -> Result<(), String> {
         Self::attach_inner(
@@ -71,6 +76,7 @@ impl HypercoreReplicationClient {
             handshake_hash,
             core_public_key,
             core,
+            manifest_slot,
             outbound_tx,
         )
     }
@@ -84,6 +90,7 @@ impl HypercoreReplicationClient {
         handshake_hash: &[u8; 64],
         core_public_key: [u8; 32],
         core: Arc<Mutex<Hypercore>>,
+        manifest_slot: Option<ManifestSlot>,
         outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     ) -> Result<(), String> {
         if verify_handshake {
@@ -99,6 +106,7 @@ impl HypercoreReplicationClient {
         let client = Arc::new(Mutex::new(Self {
             channel_id,
             core,
+            manifest_slot,
             outbound_tx: outbound_tx.clone(),
             peer_state: ClientPeerState {
                 can_upgrade: true,
@@ -118,6 +126,14 @@ impl HypercoreReplicationClient {
             let payload = payload.to_vec();
             tokio::spawn(async move {
                 let mut guard = client.lock().await;
+                if msg_type == 3 {
+                    if let Some((data, manifest)) = decode_data_message(&payload) {
+                        if let Err(err) = guard.on_data(data, manifest).await {
+                            warn!("hypercore replication client error: {err}");
+                        }
+                    }
+                    return;
+                }
                 if let Some(message) = decode_message(msg_type, &payload) {
                     if let Err(err) = guard.on_message(message).await {
                         warn!("hypercore replication client error: {err}");
@@ -144,6 +160,7 @@ impl HypercoreReplicationClient {
         handshake_hash: &[u8; 64],
         core_public_key: [u8; 32],
         core: Arc<Mutex<Hypercore>>,
+        manifest_slot: Option<ManifestSlot>,
         outbound_tx: mpsc::UnboundedSender<ReplicationOutbound>,
     ) -> Result<(), String> {
         Self::attach_inbound(
@@ -154,8 +171,24 @@ impl HypercoreReplicationClient {
             handshake_hash,
             core_public_key,
             core,
+            manifest_slot,
             outbound_tx,
         )
+    }
+
+    fn needs_manifest(&self) -> bool {
+        self.manifest_slot.is_some()
+            && self
+                .manifest_slot
+                .as_ref()
+                .and_then(|slot| slot.try_lock().ok().and_then(|g| if g.is_none() { Some(()) } else { None }))
+                .is_some()
+    }
+
+    async fn store_manifest(&self, manifest: HypercoreManifest) {
+        if let Some(slot) = &self.manifest_slot {
+            *slot.lock().await = Some(manifest);
+        }
     }
 
     fn send_message(&self, message: Message) -> Result<(), String> {
@@ -170,7 +203,7 @@ impl HypercoreReplicationClient {
     async fn on_message(&mut self, message: Message) -> Result<(), String> {
         match message {
             Message::Synchronize(msg) => self.on_synchronize(msg).await,
-            Message::Data(msg) => self.on_data(msg).await,
+            Message::Data(msg) => self.on_data(msg, None).await,
             Message::Range(_) => Ok(()),
             _ => Ok(()),
         }
@@ -205,6 +238,20 @@ impl HypercoreReplicationClient {
             }))?;
         }
 
+        if first_sync && self.needs_manifest() {
+            self.next_request_id += 1;
+            self.send_message(Message::Request(Request {
+                id: self.next_request_id,
+                fork: message.fork,
+                hash: None,
+                block: None,
+                seek: None,
+                upgrade: None,
+                manifest: true,
+                priority: 0,
+            }))?;
+        }
+
         if self.peer_state.remote_length > info.length
             && self.peer_state.length_acked == info.length
             && length_changed
@@ -220,14 +267,18 @@ impl HypercoreReplicationClient {
                     start: info.length,
                     length: self.peer_state.remote_length - info.length,
                 }),
-                manifest: false,
+                manifest: self.needs_manifest(),
                 priority: 0,
             }))?;
         }
         Ok(())
     }
 
-    async fn on_data(&mut self, message: Data) -> Result<(), String> {
+    async fn on_data(&mut self, message: Data, manifest: Option<HypercoreManifest>) -> Result<(), String> {
+        if let Some(manifest) = manifest {
+            self.store_manifest(manifest).await;
+        }
+
         let (old_info, new_info, follow_up) = {
             let mut core = self.core.lock().await;
             let old_info = core.info();

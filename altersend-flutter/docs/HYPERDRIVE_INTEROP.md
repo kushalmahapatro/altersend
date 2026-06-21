@@ -52,6 +52,14 @@ Flutter+Rust now **detects** when a connected peer opens `hypercore/alpha` and m
 
 1. **End-to-end manual interop** — Flutter sender → legacy receiver and legacy sender → Flutter receiver on real devices.
 
+## Legacy sender blobs key resolution
+
+Legacy Hyperdrive senders often leave `contentFeed` empty in hyperbee block 0. Flutter receivers now:
+
+1. Prefer `contentFeed` from the hyperbee header when present (Flutter outgoing drives write this).
+2. Otherwise request the metadata core manifest over `hypercore/alpha` replication (`manifest: true`).
+3. Derive the blobs core public key via JS-compatible `Hyperdrive.getContentManifest()` + `Hypercore.key()`.
+
 ## Crates
 
 ```

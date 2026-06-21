@@ -1,5 +1,8 @@
 use compact_encoding::CompactEncoding;
 use hypercore_protocol::{Message, schema::*};
+use hypercore_schema::{DataBlock, DataHash, DataSeek, DataUpgrade};
+
+use crate::hyperdrive::HypercoreManifest;
 
 fn decode_body<T>(payload: &[u8]) -> Option<T>
 where
@@ -8,6 +11,61 @@ where
     let mut buf = payload;
     let (value, _rest) = T::decode(&mut buf).ok()?;
     Some(value)
+}
+
+/// Decode a replication `data` message, including optional JS manifest payloads.
+pub fn decode_data_message(payload: &[u8]) -> Option<(Data, Option<HypercoreManifest>)> {
+    let mut buf = payload;
+    let (flags, rest) = u64::decode(&mut buf).ok()?;
+    let (request, rest) = u64::decode(rest).ok()?;
+    let (fork, mut rest) = u64::decode(rest).ok()?;
+
+    let block = if flags & 1 != 0 {
+        let (value, next) = DataBlock::decode(rest).ok()?;
+        rest = next;
+        Some(value)
+    } else {
+        None
+    };
+    let hash = if flags & 2 != 0 {
+        let (value, next) = DataHash::decode(rest).ok()?;
+        rest = next;
+        Some(value)
+    } else {
+        None
+    };
+    let seek = if flags & 4 != 0 {
+        let (value, next) = DataSeek::decode(rest).ok()?;
+        rest = next;
+        Some(value)
+    } else {
+        None
+    };
+    let upgrade = if flags & 8 != 0 {
+        let (value, next) = DataUpgrade::decode(rest).ok()?;
+        rest = next;
+        Some(value)
+    } else {
+        None
+    };
+    let manifest = if flags & 16 != 0 {
+        let (value, next) = HypercoreManifest::decode(rest).ok()?;
+        rest = next;
+        Some(value)
+    } else {
+        None
+    };
+
+    let data = Data {
+        request,
+        fork,
+        block,
+        hash,
+        seek,
+        upgrade,
+    };
+    let _ = rest;
+    Some((data, manifest))
 }
 
 pub fn decode_message(msg_type: u64, payload: &[u8]) -> Option<Message> {

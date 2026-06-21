@@ -534,6 +534,7 @@ async fn open_incoming_replication_channels(
             handshake_hash,
             public_key,
             core,
+            None,
             repl_out_tx.clone(),
         ) {
             warn!("attach outbound replication: {err}");
