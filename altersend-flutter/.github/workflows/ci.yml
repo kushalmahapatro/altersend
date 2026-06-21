@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - 'altersend-flutter/**'
+  pull_request:
+    paths:
+      - 'altersend-flutter/**'
+
+defaults:
+  run:
+    working-directory: altersend-flutter
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+      - name: Test Rust workspace
+        run: cargo test --all
+
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Install codegen tools
+        run: |
+          cargo install flutter_rust_bridge_codegen --version 2.11.1
+          cargo install cargo-expand
+      - name: Generate FFI
+        run: flutter_rust_bridge_codegen generate
+      - name: Analyze Flutter
+        run: |
+          cd app
+          flutter pub get
+          flutter analyze

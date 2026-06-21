@@ -1,0 +1,20 @@
+[package]
+name = "altersend_p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+altersend_domain = { path = "../altersend_domain" }
+altersend_mux = { path = "../altersend_mux" }
+altersend_storage = { path = "../altersend_storage" }
+bytes = "1"
+futures = "0.3"
+hex = { workspace = true }
+peeroxide = "1.3"
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
